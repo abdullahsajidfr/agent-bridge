@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { execSync } from "node:child_process";
+import { createServer, Socket, type Server } from "node:net";
 import { CodexAdapter } from "../codex-adapter";
 
 function createAdapter() {
@@ -1054,5 +1056,555 @@ describe("CodexAdapter initialize reconnect", () => {
 
     expect(adapter.threadId).toBeNull();
     expect(adapter.injectMessage("hello")).toBe(false);
+  });
+});
+
+describe("CodexAdapter port precheck — LISTEN-only filter", () => {
+  function runLsof(args: string): string[] {
+    try {
+      return execSync(`lsof ${args}`, {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  test("buildPortListenLsofCommand restricts to LISTEN sockets", () => {
+    expect(CodexAdapter.buildPortListenLsofCommand(4501)).toBe(
+      "lsof -ti tcp:4501 -sTCP:LISTEN",
+    );
+  });
+
+  test("LISTEN filter ignores stale outbound FDs after listener dies", async () => {
+    const port = 40000 + Math.floor(Math.random() * 10000);
+
+    const server: Server = await new Promise((resolve, reject) => {
+      const s = createServer();
+      s.once("error", reject);
+      s.listen(port, "127.0.0.1", () => resolve(s));
+    });
+
+    const client: Socket = await new Promise((resolve, reject) => {
+      const c = new Socket();
+      c.once("error", reject);
+      c.connect(port, "127.0.0.1", () => resolve(c));
+    });
+
+    try {
+      // Sanity check: while listener is alive, LISTEN filter finds this process.
+      const withListener = runLsof(CodexAdapter.buildPortListenLsofCommand(port).slice(5));
+      expect(withListener).toContain(String(process.pid));
+
+      // Close the listener; the established outbound client FD lingers in this process.
+      await new Promise<void>((r) => server.close(() => r()));
+
+      // OLD impl `lsof -ti :PORT` (no LISTEN filter) would still find this process
+      // via the lingering outbound FD — the false positive that broke `abg claude`.
+      // NEW impl correctly returns no PIDs because nothing is LISTENING anymore.
+      const afterClose = runLsof(CodexAdapter.buildPortListenLsofCommand(port).slice(5));
+      expect(afterClose).toEqual([]);
+    } finally {
+      client.destroy();
+      if (server.listening) server.close();
+    }
+  });
+});
+
+describe("CodexAdapter TUI outage recovery", () => {
+  type FakeSocket = {
+    data: { connId: number };
+    closed: Array<{ code: number; reason: string }>;
+    sent: string[];
+    close: (code: number, reason: string) => void;
+    send: (data: string) => void;
+  };
+
+  function makeFakeSocket(connId: number): FakeSocket {
+    const closed: Array<{ code: number; reason: string }> = [];
+    const sent: string[] = [];
+    return {
+      data: { connId },
+      closed,
+      sent,
+      close(code: number, reason: string) {
+        closed.push({ code, reason });
+      },
+      send(data: string) {
+        sent.push(data);
+      },
+    };
+  }
+
+  function setupAdapterWithTui(connId = 1) {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    const ws = makeFakeSocket(connId);
+    adapter.tuiConnId = connId;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = null;
+    return { adapter, ws, logs };
+  }
+
+  test("buffers TUI message when app-server is not connected (does not close)", () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+
+    adapter.onTuiMessage(ws, JSON.stringify({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "test",
+      params: {},
+    }));
+
+    expect(ws.closed.length).toBe(0);
+    expect(adapter.outageQueue.length).toBe(1);
+    expect(adapter.outageTimer).not.toBeNull();
+    expect(logs.some((l) => l.startsWith("DIAGNOSTIC: buffered TUI message"))).toBe(true);
+
+    // Cleanup timer to not leak into other tests.
+    clearTimeout(adapter.outageTimer);
+    adapter.outageTimer = null;
+  });
+
+  test("overflows with 1011 when queue fills past OUTAGE_QUEUE_MAX", () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+    const max = (adapter.constructor as any).OUTAGE_QUEUE_MAX;
+    expect(typeof max).toBe("number");
+
+    // Fill to capacity.
+    for (let i = 0; i < max; i++) {
+      adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: i, method: "m", params: {} }));
+    }
+    expect(adapter.outageQueue.length).toBe(max);
+    expect(ws.closed.length).toBe(0);
+
+    // One more triggers overflow and close.
+    adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: max, method: "m", params: {} }));
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/queue overflow/);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(logs.some((l) => l.includes("outage queue overflow"))).toBe(true);
+  });
+
+  test("drains queued messages in order when app-server reconnects (notifications)", () => {
+    const { adapter, ws } = setupAdapterWithTui();
+    // Notifications (no id) don't trigger id-rewriting, so we can compare
+    // raw bytes exactly. The key property under test is order + count.
+    adapter.outageQueue = [
+      { raw: '{"jsonrpc":"2.0","method":"a"}', connId: 1 },
+      { raw: '{"jsonrpc":"2.0","method":"b"}', connId: 1 },
+      { raw: '{"jsonrpc":"2.0","method":"c"}', connId: 1 },
+    ];
+    adapter.outageTimer = setTimeout(() => {}, 60_000);
+
+    const sent: string[] = [];
+    adapter.appServerWs = {
+      readyState: 1 /* WebSocket.OPEN */,
+      send: (data: string) => sent.push(data),
+    };
+
+    adapter.drainOutageQueue();
+
+    expect(sent).toEqual([
+      '{"jsonrpc":"2.0","method":"a"}',
+      '{"jsonrpc":"2.0","method":"b"}',
+      '{"jsonrpc":"2.0","method":"c"}',
+    ]);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(ws.closed.length).toBe(0);
+  });
+
+  test("drain re-assigns fresh proxy ids for requests (no stale mapping race)", () => {
+    const { adapter, ws } = setupAdapterWithTui();
+    // A TUI → app-server REQUEST (has both id and method). On outage we
+    // store RAW, so the replay goes through onTuiMessage's rewriting path
+    // against the fresh app-server session. This prevents the race Codex
+    // flagged where handleAppServerClose() would wipe upstreamToClient
+    // and strand forwarded bytes pointing at a dead mapping.
+    adapter.outageQueue = [
+      { raw: '{"jsonrpc":"2.0","id":"client-42","method":"thread/start","params":{}}', connId: 1 },
+    ];
+    adapter.outageTimer = setTimeout(() => {}, 60_000);
+
+    const sent: string[] = [];
+    adapter.appServerWs = {
+      readyState: 1 /* WebSocket.OPEN */,
+      send: (data: string) => sent.push(data),
+    };
+    // Observe the upstreamToClient map before and after.
+    expect(adapter.upstreamToClient.size).toBe(0);
+
+    adapter.drainOutageQueue();
+
+    expect(sent.length).toBe(1);
+    const forwarded = JSON.parse(sent[0]);
+    expect(forwarded.method).toBe("thread/start");
+    expect(typeof forwarded.id).toBe("number"); // proxy id is numeric
+    expect(forwarded.id).not.toBe("client-42"); // was rewritten
+
+    // Mapping for the new proxy id was registered on the fresh session.
+    expect(adapter.upstreamToClient.size).toBe(1);
+    const mapping = adapter.upstreamToClient.get(forwarded.id);
+    expect(mapping).toEqual({ connId: 1, clientId: "client-42" });
+
+    expect(ws.closed.length).toBe(0);
+  });
+
+  test("closes TUI with 1011 when outage timer fires", async () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+    // Shrink timeout for the test via monkey-patching the static value.
+    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 20;
+
+    adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: {} }));
+    expect(adapter.outageQueue.length).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/after \d+ms/);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(logs.some((l) => l.includes("did not return within"))).toBe(true);
+
+    // Restore default.
+    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 5000;
+  });
+
+  test("drops non-primary outage sends with WARNING log (no close)", () => {
+    const { adapter, logs } = setupAdapterWithTui(2);
+    const stale = makeFakeSocket(1);
+
+    adapter.onTuiMessage(stale, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: {} }));
+
+    // Stale connection messages are filtered earlier by the tuiConnId guard,
+    // so we don't even reach the forward path. Verify nothing was buffered.
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(stale.closed.length).toBe(0);
+    // The higher-layer "Dropping message from stale TUI conn" log fires instead.
+    expect(logs.some((l) => l.includes("stale TUI"))).toBe(true);
+  });
+});
+
+describe("CodexAdapter session restore after unintentional reconnect", () => {
+  type FakeSocket = {
+    data: { connId: number };
+    closed: Array<{ code: number; reason: string }>;
+    close: (code: number, reason: string) => void;
+    send: (data: string) => void;
+  };
+
+  function makeFakeSocket(connId: number): FakeSocket {
+    const closed: Array<{ code: number; reason: string }> = [];
+    return {
+      data: { connId },
+      closed,
+      close(code: number, reason: string) {
+        closed.push({ code, reason });
+      },
+      send() {},
+    };
+  }
+
+  function makeFakeAppServerWs() {
+    const sent: string[] = [];
+    return {
+      readyState: 1 /* WebSocket.OPEN */,
+      sent,
+      send: function (data: string) {
+        sent.push(data);
+      },
+    };
+  }
+
+  test("sendReplayAndAwait resolves when app-server responds with matching id (no error)", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-1", method: "initialize" }),
+      "initialize",
+    );
+
+    // Simulate app-server response arriving via handleAppServerPayload.
+    setTimeout(() => {
+      const consumed = adapter.handleAppServerPayload(JSON.stringify({
+        id: "replay-1",
+        result: { capabilities: {} },
+      }));
+      // Response should have been swallowed (not forwarded to TUI).
+      expect(consumed).toBeNull();
+    }, 5);
+
+    const response = await promise;
+    expect(response).toEqual({ id: "replay-1", result: { capabilities: {} } });
+  });
+
+  test("sendReplayAndAwait rejects when app-server responds with error field", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-err", method: "initialize" }),
+      "initialize",
+    );
+
+    setTimeout(() => {
+      adapter.handleAppServerPayload(JSON.stringify({
+        id: "replay-err",
+        error: { message: "already initialized" },
+      }));
+    }, 5);
+
+    await expect(promise).rejects.toThrow(/initialize rejected: already initialized/);
+  });
+
+  test("sendReplayAndAwait rejects on timeout", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+    (adapter.constructor as any).SESSION_REPLAY_TIMEOUT_MS = 30;
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-timeout", method: "initialize" }),
+      "initialize",
+    );
+
+    await expect(promise).rejects.toThrow(/replay timeout/);
+    (adapter.constructor as any).SESSION_REPLAY_TIMEOUT_MS = 5000;
+  });
+
+  test("handleSessionRestoreAfterReconnect bails when no cached initialize", async () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    adapter.appServerWs = makeFakeAppServerWs();
+    adapter.lastInitializeRaw = null;
+
+    await adapter.handleSessionRestoreAfterReconnect();
+
+    expect(logs.some((l) => l.includes("no cached initialize"))).toBe(true);
+  });
+
+  test("handleSessionRestoreAfterReconnect closes TUI 1011 on initialize failure", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    adapter.lastInitializeRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "init-will-fail",
+      method: "initialize",
+      params: {},
+    });
+
+    const restorePromise = adapter.handleSessionRestoreAfterReconnect();
+
+    // Simulate app-server rejecting the replayed initialize.
+    setTimeout(() => {
+      adapter.handleAppServerPayload(JSON.stringify({
+        id: "init-will-fail",
+        error: { message: "schema mismatch" },
+      }));
+    }, 5);
+
+    await restorePromise;
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/initialize rejected: schema mismatch/);
+  });
+
+  test("handleSessionRestoreAfterReconnect sends initialize + initialized + thread/resume when happy path", async () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    adapter.lastInitializeRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "replay-init",
+      method: "initialize",
+      params: {},
+    });
+    adapter.lastInitializedRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialized",
+    });
+    adapter.threadId = "thread-xyz";
+
+    const restorePromise = adapter.handleSessionRestoreAfterReconnect();
+
+    // Respond to each replayed request in order.
+    await new Promise((r) => setTimeout(r, 2));
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: "replay-init",
+      result: { ok: true },
+    }));
+
+    // Give the initialize promise a chance to resolve before responding
+    // to thread/resume.
+    await new Promise((r) => setTimeout(r, 2));
+    // The thread/resume id is generated dynamically — inspect what was
+    // sent to find it.
+    const resumeSent = server.sent.find((s: string) => s.includes("thread/resume"));
+    expect(resumeSent).toBeDefined();
+    const resumeId = JSON.parse(resumeSent!).id;
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: resumeId,
+      result: { thread: { id: "thread-xyz" } },
+    }));
+
+    await restorePromise;
+
+    // Expected 3 sends: initialize, initialized, thread/resume.
+    expect(server.sent.length).toBe(3);
+    expect(JSON.parse(server.sent[0]).method).toBe("initialize");
+    expect(JSON.parse(server.sent[1]).method).toBe("initialized");
+    expect(JSON.parse(server.sent[2]).method).toBe("thread/resume");
+    expect(JSON.parse(server.sent[2]).params).toEqual({ threadId: "thread-xyz" });
+
+    expect(ws.closed.length).toBe(0);
+    expect(logs.some((l) => l.includes("session restored"))).toBe(true);
+  });
+
+  test("onTuiMessage buffers during sessionRestoreInProgress (no leak to uninitialized session)", () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = makeFakeAppServerWs();
+    adapter.sessionRestoreInProgress = true;
+
+    adapter.onTuiMessage(ws, JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "turn/steer",
+      params: {},
+    }));
+
+    // Message should have been pushed onto the outage queue, not sent to
+    // app-server, because restore was in progress.
+    expect(adapter.outageQueue.length).toBe(1);
+    expect(adapter.appServerWs.sent.length).toBe(0);
+
+    // Cleanup timer to avoid leaking into other tests.
+    if (adapter.outageTimer) {
+      clearTimeout(adapter.outageTimer);
+      adapter.outageTimer = null;
+    }
+  });
+
+  test("onTuiMessage caches initialize and initialized raw payloads", () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    // The `initialize` request triggers reconnectAppServerForNewSession
+    // which caches the raw payload.
+    const initRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "init-1",
+      method: "initialize",
+      params: { foo: "bar" },
+    });
+    // Stub out the reconnect to avoid real network activity.
+    adapter.reconnectAppServerForNewSession = async () => {};
+    adapter.onTuiMessage(ws, initRaw);
+    expect(adapter.lastInitializeRaw).toBe(initRaw);
+
+    // `initialized` notification is captured in the normal forward path.
+    const initedRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialized",
+    });
+    adapter.reconnectingForNewSession = false;
+    adapter.onTuiMessage(ws, initedRaw);
+    expect(adapter.lastInitializedRaw).toBe(initedRaw);
+  });
+});
+
+describe("CodexAdapter thread/closed diagnostic sniffer", () => {
+  test("logs DIAGNOSTIC line when app-server emits thread/closed", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/closed",
+      params: { threadId: "abc-123" },
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC: app-server emitted thread/closed"));
+    expect(diag.length).toBe(1);
+    expect(diag[0]).toContain("threadId=abc-123");
+  });
+
+  test("handles thread/closed with missing params gracefully", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/closed",
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC: app-server emitted thread/closed"));
+    expect(diag.length).toBe(1);
+    expect(diag[0]).toContain("threadId=unknown");
+  });
+
+  test("does not log DIAGNOSTIC for other notifications", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { threadId: "abc-123" },
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC:"));
+    expect(diag.length).toBe(0);
   });
 });

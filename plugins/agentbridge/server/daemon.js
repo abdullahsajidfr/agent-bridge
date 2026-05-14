@@ -54,6 +54,9 @@ class StateDirResolver {
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
   }
+  get codexWrapperLogFile() {
+    return join(this.stateDir, "codex-wrapper.log");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }
@@ -133,6 +136,15 @@ class CodexAdapter extends EventEmitter {
   reconnectingForNewSession = false;
   replayingBufferedMessages = false;
   appServerGeneration = 0;
+  outageQueue = [];
+  outageTimer = null;
+  static OUTAGE_QUEUE_MAX = 64;
+  static OUTAGE_TIMEOUT_MS = 5000;
+  lastInitializeRaw = null;
+  lastInitializedRaw = null;
+  sessionRestoreInProgress = false;
+  replayPending = new Map;
+  static SESSION_REPLAY_TIMEOUT_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -172,6 +184,8 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.outageQueue = [];
+    this.clearOutageTimer();
     this.appServerWs?.close();
     this.appServerWs = null;
     for (const [id, sec] of this.secondaryConnections) {
@@ -253,6 +267,14 @@ class CodexAdapter extends EventEmitter {
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
+        if (isReconnect) {
+          this.handleSessionRestoreAfterReconnect().finally(() => this.drainOutageQueue()).catch((e) => {
+            const m = e instanceof Error ? e.message : String(e);
+            this.log(`session restore unexpected error: ${m}`);
+          });
+        } else {
+          this.drainOutageQueue();
+        }
         resolve();
       };
       appWs.onmessage = (event) => {
@@ -351,13 +373,173 @@ class CodexAdapter extends EventEmitter {
     }, delay);
   }
   handleAppServerClose() {
-    this.log("App-server connection closed");
+    const intentional = this.intentionalDisconnect;
+    const tuiConnected = this.tuiWs !== null;
+    this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
     this.clearResponseTrackingState();
     this.activeTurnIds.clear();
     this.turnInProgress = false;
-    if (!this.intentionalDisconnect) {
+    if (!intentional) {
       this.scheduleReconnect();
+    }
+  }
+  bufferDuringOutage(ws, raw) {
+    if (this.outageQueue.length >= CodexAdapter.OUTAGE_QUEUE_MAX) {
+      this.log(`ERROR: outage queue overflow (${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX}) \u2014 closing TUI with 1011`);
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      if (this.tuiWs && this.tuiWs === ws) {
+        try {
+          ws.close(1011, "agentbridge: app-server unavailable; pending TUI queue overflow");
+        } catch (e) {
+          this.log(`Failed to close TUI WS after outage queue overflow: ${e.message}`);
+        }
+      }
+      return;
+    }
+    this.outageQueue.push({ raw, connId: ws.data.connId });
+    this.log(`DIAGNOSTIC: buffered TUI message while app-server unavailable (queue size=${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX})`);
+    this.ensureOutageTimer();
+  }
+  ensureOutageTimer() {
+    if (this.outageTimer !== null)
+      return;
+    this.outageTimer = setTimeout(() => {
+      this.outageTimer = null;
+      const buffered = this.outageQueue.length;
+      this.outageQueue = [];
+      this.log(`ERROR: app-server did not return within ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms (buffered=${buffered}) \u2014 closing TUI with 1011`);
+      const ws = this.tuiWs;
+      if (ws) {
+        try {
+          ws.close(1011, `agentbridge: app-server unavailable after ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms; buffered=${buffered}`);
+        } catch (e) {
+          this.log(`Failed to close TUI WS on outage timeout: ${e.message}`);
+        }
+      }
+    }, CodexAdapter.OUTAGE_TIMEOUT_MS);
+  }
+  clearOutageTimer() {
+    if (this.outageTimer !== null) {
+      clearTimeout(this.outageTimer);
+      this.outageTimer = null;
+    }
+  }
+  async handleSessionRestoreAfterReconnect() {
+    if (!this.lastInitializeRaw) {
+      this.log("DIAGNOSTIC: no cached initialize to replay after unintentional reconnect");
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("DIAGNOSTIC: app-server not open at session restore start \u2014 skipping");
+      return;
+    }
+    this.sessionRestoreInProgress = true;
+    try {
+      this.log(`DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`);
+      await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
+      if (this.lastInitializedRaw && this.appServerWs.readyState === WebSocket.OPEN) {
+        this.appServerWs.send(this.lastInitializedRaw);
+      }
+      if (this.threadId && this.appServerWs.readyState === WebSocket.OPEN) {
+        const replayId = `agentbridge-replay-thread-resume-${Date.now()}`;
+        const resumeRaw = JSON.stringify({
+          jsonrpc: "2.0",
+          id: replayId,
+          method: "thread/resume",
+          params: { threadId: this.threadId }
+        });
+        await this.sendReplayAndAwait(resumeRaw, "thread/resume");
+      }
+      this.log(`DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`ERROR: session restore failed (${msg}) \u2014 closing TUI with 1011`);
+      const tuiWs = this.tuiWs;
+      if (tuiWs) {
+        try {
+          tuiWs.close(1011, `agentbridge: session restore failed: ${msg}`);
+        } catch (closeErr) {
+          const cm = closeErr instanceof Error ? closeErr.message : String(closeErr);
+          this.log(`Failed to close TUI after session restore failure: ${cm}`);
+        }
+      }
+    } finally {
+      this.sessionRestoreInProgress = false;
+    }
+  }
+  sendReplayAndAwait(raw, method) {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("app-server not open"));
+    }
+    let id;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.id === undefined) {
+        return Promise.reject(new Error(`replay payload for ${method} has no id`));
+      }
+      id = parsed.id;
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replayPending.delete(id);
+        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
+      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
+      this.replayPending.set(id, { method, resolve, reject, timer });
+      try {
+        this.appServerWs.send(raw);
+      } catch (e) {
+        clearTimeout(timer);
+        this.replayPending.delete(id);
+        const m = e instanceof Error ? e.message : String(e);
+        reject(new Error(`replay send failed for ${method}: ${m}`));
+      }
+    });
+  }
+  tryConsumeReplayResponse(payload) {
+    const id = payload.id;
+    if (id === undefined)
+      return false;
+    const pending = this.replayPending.get(id);
+    if (!pending)
+      return false;
+    clearTimeout(pending.timer);
+    this.replayPending.delete(id);
+    if (payload.error !== undefined) {
+      const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error ? String(payload.error.message ?? "unknown") : JSON.stringify(payload.error);
+      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+    } else {
+      pending.resolve(payload);
+    }
+    return true;
+  }
+  drainOutageQueue() {
+    if (this.outageQueue.length === 0) {
+      this.clearOutageTimer();
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return;
+    const ws = this.tuiWs;
+    if (!ws) {
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      return;
+    }
+    const messages = this.outageQueue;
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.log(`DIAGNOSTIC: replaying ${messages.length} buffered TUI messages after app-server reconnect`);
+    for (const msg of messages) {
+      try {
+        this.onTuiMessage(ws, msg.raw);
+      } catch (e) {
+        this.log(`Failed to replay buffered TUI message (conn #${msg.connId}): ${e.message}`);
+      }
     }
   }
   startProxy() {
@@ -505,12 +687,18 @@ class CodexAdapter extends EventEmitter {
       return;
     }
     if (this.tuiWs === ws) {
-      this.log(`TUI disconnected (conn #${connId})`);
+      const appServerOpen = this.appServerWs?.readyState === WebSocket.OPEN;
+      this.log(`TUI disconnected (conn #${connId}, appServerOpen=${appServerOpen}, turnInProgress=${this.turnInProgress}, pendingTuiMessages=${this.pendingTuiMessages.length}, outageQueue=${this.outageQueue.length}, reconnectingForNewSession=${this.reconnectingForNewSession})`);
       this.tuiWs = null;
       if (this.reconnectingForNewSession) {
         this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
         this.pendingTuiMessages = [];
         this.reconnectingForNewSession = false;
+      }
+      if (this.outageQueue.length > 0 || this.outageTimer !== null) {
+        this.log(`Clearing outage queue on TUI disconnect (buffered=${this.outageQueue.length})`);
+        this.outageQueue = [];
+        this.clearOutageTimer();
       }
       this.emit("tuiDisconnected", connId);
     } else {
@@ -574,6 +762,7 @@ class CodexAdapter extends EventEmitter {
     } catch {}
     if (!this.replayingBufferedMessages) {
       if (detectedMethod === "initialize") {
+        this.lastInitializeRaw = data;
         this.log("Detected initialize \u2014 reconnecting app-server for fresh session");
         this.reconnectingForNewSession = true;
         this.pendingTuiMessages = [data];
@@ -584,6 +773,17 @@ class CodexAdapter extends EventEmitter {
         this.pendingTuiMessages.push(data);
         return;
       }
+    }
+    if (detectedMethod === "initialized") {
+      this.lastInitializedRaw = data;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN || this.sessionRestoreInProgress) {
+      if (this.tuiWs && this.tuiWs === ws) {
+        this.bufferDuringOutage(ws, data);
+      } else {
+        this.log(`WARNING: non-primary TUI attempted to send while app-server down \u2014 dropped (connId=${connId})`);
+      }
+      return;
     }
     let forwarded = data;
     try {
@@ -605,14 +805,24 @@ class CodexAdapter extends EventEmitter {
     if (this.appServerWs?.readyState === WebSocket.OPEN) {
       this.appServerWs.send(forwarded);
     } else {
-      this.log(`WARNING: app-server not connected, dropping message`);
+      this.log(`WARNING: app-server closed between OPEN check and send \u2014 message lost (connId=${ws.data.connId})`);
     }
   }
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
+        if (this.tryConsumeReplayResponse(parsed)) {
+          return null;
+        }
+      }
       if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
         const notificationLike = parsed;
+        if (notificationLike.method === "thread/closed") {
+          const params = notificationLike.params;
+          const threadId = typeof params?.threadId === "string" ? params.threadId : "unknown";
+          this.log(`DIAGNOSTIC: app-server emitted thread/closed (threadId=${threadId}) \u2014 TUI will exit(0) silently`);
+        }
         const forwarded = this.patchResponse(notificationLike, raw);
         this.interceptServerMessage(notificationLike);
         return forwarded;
@@ -1008,10 +1218,15 @@ class CodexAdapter extends EventEmitter {
     this.serverRequestToProxy.clear();
     this.pendingServerResponses.clear();
   }
+  static buildPortListenLsofCommand(port) {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
   async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
       try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8"
+        }).trim();
         if (!pids)
           continue;
         const pidList = pids.split(`
@@ -1041,7 +1256,9 @@ class CodexAdapter extends EventEmitter {
           throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
         }
         try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8"
+          }).trim();
           if (remaining) {
             throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
           }
@@ -1656,6 +1873,7 @@ var idleShutdownTimer = null;
 var claudeDisconnectTimer = null;
 var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
+var codexCollaborationKickoffSent = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var bufferedMessages = [];
@@ -1722,6 +1940,9 @@ codex.on("turnCompleted", () => {
   replyReceivedDuringTurn = false;
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
@@ -2054,9 +2275,23 @@ function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 function notifyCodexClaudeOnline() {
+  const message = !codexCollaborationKickoffSent ? [
+    "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
+    "You are now in a multi-agent collaboration session.",
+    "When you receive a complex task, propose a division of labor to Claude.",
+    "Claude can send you messages \u2014 they will appear as injected user messages.",
+    "Respond naturally and Claude will receive your output via AgentBridge."
+  ].join(`
+`) : "\u2705 AgentBridge connected to Claude Code.";
+  const delivered = codex.injectMessage(message);
+  if (!delivered) {
+    log("Deferred Claude-online notice to Codex \u2014 will retry after current turn completes");
+    return false;
+  }
   claudeOnlineNoticeSent = true;
   claudeOfflineNoticeShown = false;
-  codex.injectMessage("\u2705 AgentBridge connected to Claude Code.");
+  codexCollaborationKickoffSent = true;
+  return true;
 }
 function shouldNotifyCodexClaudeOnline() {
   return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
