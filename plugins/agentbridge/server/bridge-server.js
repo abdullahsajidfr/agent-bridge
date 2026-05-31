@@ -14094,6 +14094,38 @@ class DaemonClient extends EventEmitter2 {
       }
     });
   }
+  async probeIncumbent(timeoutMs = 3000) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return { connected: false, alive: false };
+    }
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const finish = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        if (timer)
+          clearTimeout(timer);
+        this.off("incumbentStatus", onStatus);
+        this.off("disconnect", onDisconnect);
+        this.off("rejected", onRejected);
+        resolve(value);
+      };
+      const onStatus = (s) => finish(s);
+      const onDisconnect = () => finish({ connected: false, alive: false });
+      const onRejected = () => finish({ connected: false, alive: false });
+      this.on("incumbentStatus", onStatus);
+      this.on("disconnect", onDisconnect);
+      this.on("rejected", onRejected);
+      timer = setTimeout(() => finish({ connected: false, alive: false }), timeoutMs);
+      try {
+        this.send({ type: "probe_incumbent" });
+      } catch {
+        finish({ connected: false, alive: false });
+      }
+    });
+  }
   async disconnect() {
     if (!this.ws)
       return;
@@ -14149,6 +14181,9 @@ class DaemonClient extends EventEmitter2 {
         }
         case "status":
           this.emit("status", message.status);
+          return;
+        case "incumbent_status":
+          this.emit("incumbentStatus", { connected: message.connected, alive: message.alive });
           return;
       }
     };
@@ -14548,9 +14583,8 @@ function pairScopedCommand(cmd) {
   const pairId = process.env.AGENTBRIDGE_PAIR_ID;
   if (!pairId)
     return `agentbridge ${cmd}`;
-  const [sub, ...rest] = cmd.split(" ");
-  const tail = rest.length > 0 ? ` ${rest.join(" ")}` : "";
-  return `agentbridge ${sub} --pair ${pairId}${tail}`;
+  const selector = process.env.AGENTBRIDGE_PAIR_NAME || pairId;
+  return `agentbridge --pair ${selector} ${cmd}`;
 }
 
 // src/bridge-disabled-state.ts
