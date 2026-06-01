@@ -47,6 +47,16 @@ const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
 const IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
 const ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
+// Bootstrap-readiness watchdog: if the Codex layer never becomes ready within this
+// window the daemon self-exits to release its control port (prevents the
+// healthz-200/readyz-503 zombie). Default 45s is deliberately > the worst-case
+// bootCodex retry budget (CODEX_BOOT_RETRIES+1 attempts × ~10s codex.start internal
+// timeout + 1s/2s backoff ≈ 33s) so it never cuts off a legitimately-retrying boot.
+const BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS", 45000);
+// In-daemon bounded retries for a transient Codex bootstrap failure (e.g. a just-killed
+// codex's port not yet released). After these, the daemon self-exits — further
+// replacement is owned by the lifecycle (ensureRunning), not by retrying forever here.
+const CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -63,6 +73,7 @@ let inAttentionWindow = false;
 let replyRequired = false;
 let replyReceivedDuringTurn = false;
 let shuttingDown = false;
+let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let lastAttachStatusSentTs = 0;
@@ -230,6 +241,10 @@ codex.on("exit", (code: number | null) => {
     ),
   );
   broadcastStatus();
+  // Codex died after a successful boot (a dead proc is not auto-respawned). Re-arm
+  // the readiness watchdog so that if it does not come back and no TUI is using us,
+  // the daemon self-exits instead of lingering as a healthz-200/readyz-503 zombie.
+  armBootDeadline();
 });
 
 function startControlServer() {
@@ -697,6 +712,10 @@ function currentStatus(): DaemonStatus {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
+    // Pair identity so ensureRunning() can detect a foreign daemon squatting this
+    // control port (wrong pairId) and replace it instead of reusing it. null in
+    // legacy/manual single-pair mode (no pairId enforcement there).
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
   };
 }
 
@@ -740,35 +759,88 @@ function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
 
+/**
+ * Arm the bootstrap-readiness watchdog. If the Codex layer is not ready within
+ * BOOTSTRAP_TIMEOUT_MS (and no TUI is actively using us), self-exit to release the
+ * control port. This is the ONLY backstop for the case where codex.start() HANGS
+ * (never resolves/rejects), so bootCodex's retry/self-exit never runs — without it
+ * the process lingers as a healthz-200/readyz-503 zombie and ensureRunning() keeps
+ * reusing it. bootCodex clears it on success; codex 'exit' re-arms it.
+ */
+function armBootDeadline() {
+  // The deadline is an ABSOLUTE start-up window — not a recurring idle timer. If a
+  // timer is already armed, leave it alone: re-arming on every codex 'exit' would let
+  // a codex crash-loop keep the daemon alive past BOOTSTRAP_TIMEOUT_MS forever. Only
+  // the very first call (right after writePidFile/startControlServer) sets the timer;
+  // subsequent 'exit' events must not extend the deadline.
+  if (bootDeadlineTimer) return;
+  bootDeadlineTimer = setTimeout(() => {
+    bootDeadlineTimer = null;
+    if (codexBootstrapped) return; // became ready in time — nothing to do
+    if (tuiConnectionState.snapshot().tuiConnected) return; // a TUI is actively using it
+    log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) — self-exiting to release control port`);
+    shutdown("codex not ready within bootstrap deadline", 1);
+  }, BOOTSTRAP_TIMEOUT_MS);
+  // Don't let the watchdog itself keep the event loop alive.
+  bootDeadlineTimer.unref?.();
+}
+
+function clearBootDeadline() {
+  if (bootDeadlineTimer) {
+    clearTimeout(bootDeadlineTimer);
+    bootDeadlineTimer = null;
+  }
+}
+
 async function bootCodex() {
   log("Starting AgentBridge daemon...");
   log(`Codex app-server: ${codex.appServerUrl}`);
   log(`Codex proxy: ${codex.proxyUrl}`);
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
 
-  try {
-    await codex.start();
-    codexBootstrapped = true;
-    writeStatusFile();
-
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
-    broadcastStatus();
-  } catch (err: any) {
-    log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(
-      systemMessage(
-        "system_codex_start_failed",
-        `❌ AgentBridge failed to start Codex app-server: ${err.message}`,
-      ),
-    );
-    broadcastStatus();
+  for (let attempt = 0; attempt <= CODEX_BOOT_RETRIES; attempt++) {
+    try {
+      await codex.start();
+      codexBootstrapped = true;
+      clearBootDeadline(); // codex up — cancel the self-exit watchdog
+      writeStatusFile();
+      emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
+      broadcastStatus();
+      return;
+    } catch (err: any) {
+      const attemptsLeft = CODEX_BOOT_RETRIES - attempt;
+      log(`Failed to start Codex (attempt ${attempt + 1}/${CODEX_BOOT_RETRIES + 1}): ${err.message}`);
+      if (attemptsLeft > 0) {
+        const backoffMs = 1000 * (attempt + 1); // 1s, 2s, … — covers transient failures (e.g. a just-killed codex's port not yet released)
+        log(`Retrying Codex bootstrap in ${backoffMs}ms (${attemptsLeft} attempt(s) left)...`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+        if (shuttingDown) return; // a deadline/signal fired during backoff
+        continue;
+      }
+      // Retries exhausted: notify Claude, then SELF-EXIT to release the control port.
+      // Staying alive here is exactly what created the healthz-200/readyz-503 zombie
+      // that ensureRunning() then reused. Releasing the port lets the next
+      // ensureRunning() launch a clean daemon. Replacement beyond this is owned by the
+      // lifecycle, not by retrying forever in-process.
+      emitToClaude(
+        systemMessage(
+          "system_codex_start_failed",
+          `❌ AgentBridge failed to start Codex app-server after ${CODEX_BOOT_RETRIES + 1} attempts: ${err.message}`,
+        ),
+      );
+      broadcastStatus();
+      shutdown("codex bootstrap failed", 1);
+      return; // shutdown() calls process.exit; explicit return also makes the
+      // "shutdown ⇒ stop" intent clear and guards the already-shutting-down path.
+    }
   }
 }
 
-function shutdown(reason: string) {
+function shutdown(reason: string, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
+  clearBootDeadline();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();
@@ -776,7 +848,7 @@ function shutdown(reason: string) {
   codex.stop();
   removePidFile();
   removeStatusFile();
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -807,4 +879,8 @@ if (daemonLifecycle.wasKilled()) {
 
 writePidFile();
 startControlServer();
+// Arm the readiness watchdog BEFORE bootCodex: if codex.start() hangs (never
+// resolves/rejects), bootCodex's retry/self-exit never runs, so this deadline is
+// the only thing that releases the control port. bootCodex clears it on success.
+armBootDeadline();
 void bootCodex();

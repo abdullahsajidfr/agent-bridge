@@ -14225,9 +14225,26 @@ class DaemonClient extends EventEmitter2 {
 import { spawn, execFileSync } from "child_process";
 import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
+
+// src/env-utils.ts
+function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) {
+  const raw = env[name];
+  if (raw == null || raw === "")
+    return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > Number.MAX_SAFE_INTEGER) {
+    log(`Invalid ${name}=${JSON.stringify(raw)} (must be a positive integer within ` + `Number.MAX_SAFE_INTEGER); falling back to ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
+
+// src/daemon-lifecycle.ts
 var DEFAULT_DAEMON_ENTRY = import.meta.url.endsWith(".ts") ? "./daemon.ts" : "./daemon.js";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
+var REUSE_READY_DELAY_MS = 250;
 
 class DaemonLifecycle {
   stateDir;
@@ -14247,38 +14264,79 @@ class DaemonLifecycle {
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
+  get expectedPairId() {
+    return process.env.AGENTBRIDGE_PAIR_ID || null;
+  }
+  async fetchStatus() {
+    try {
+      const response = await fetch(this.healthUrl);
+      if (!response.ok)
+        return null;
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+  isForeignDaemon(status) {
+    const expected = this.expectedPairId;
+    if (!expected)
+      return false;
+    if (!status)
+      return false;
+    const reported = status.pairId;
+    if (reported == null)
+      return true;
+    return reported !== expected;
+  }
   async ensureRunning() {
     if (await this.isHealthy()) {
-      await this.waitForReady();
-      return;
+      const status = await this.fetchStatus();
+      if (this.isForeignDaemon(status)) {
+        this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
+        await this.replaceUnhealthyDaemon(status?.pid);
+        return;
+      }
+      try {
+        await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+        return;
+      } catch {
+        this.log(`Daemon on control port ${this.controlPort} is healthy but not ready within reuse window \u2014 replacing`);
+        await this.replaceUnhealthyDaemon(status?.pid);
+        return;
+      }
     }
     const existingPid = this.readPid();
     if (existingPid) {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
           } catch {
-            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
+            this.log(`Existing daemon process ${existingPid} never became ready \u2014 replacing`);
+            await this.replaceUnhealthyDaemon(existingPid);
+            return;
           }
         }
         this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
       }
       this.removeStalePidFile();
     }
-    const lockAcquired = this.acquireLock();
-    if (!lockAcquired) {
-      this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
-      return;
-    }
-    try {
+    await this.withStartupLockStrict(async (locked) => {
+      if (!locked) {
+        this.log("Another process holds the startup lock, waiting for readiness+identity...");
+        await this.waitForReadyAndOurs();
+        return;
+      }
+      if (await this.isHealthy() && !this.isForeignDaemon(await this.fetchStatus())) {
+        try {
+          await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+          return;
+        } catch {}
+      }
       this.launch();
       await this.waitForReady();
-    } finally {
-      this.releaseLock();
-    }
+    });
   }
   async isHealthy() {
     try {
@@ -14311,6 +14369,17 @@ class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
+  }
+  async waitForReadyAndOurs(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isReady()) {
+        const status = await this.fetchStatus();
+        if (!this.isForeignDaemon(status))
+          return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon readiness+identity on ${this.readyUrl} (control port ${this.controlPort})`);
   }
   readStatus() {
     try {
@@ -14383,11 +14452,38 @@ class DaemonLifecycle {
     this.log("Removing stale pid file");
     this.removePidFile();
   }
-  acquireLock(depth = 0) {
-    if (depth > 1) {
-      this.log("Lock acquisition failed after retry, proceeding without lock");
-      return true;
+  async replaceUnhealthyDaemon(statusPid) {
+    await this.withStartupLockStrict(async (locked) => {
+      if (!locked) {
+        this.log("Another process holds the startup lock, waiting for readiness+identity...");
+        await this.waitForReadyAndOurs();
+        return;
+      }
+      if (await this.isHealthy()) {
+        const status = await this.fetchStatus();
+        if (!this.isForeignDaemon(status)) {
+          try {
+            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            return;
+          } catch {}
+        }
+      }
+      this.log(`Killing unhealthy daemon on control port ${this.controlPort} and relaunching`);
+      await this.kill(3000, statusPid);
+      this.launch();
+      await this.waitForReady();
+    });
+  }
+  async withStartupLockStrict(fn) {
+    const locked = this.acquireLockStrict();
+    try {
+      return await fn(locked);
+    } finally {
+      if (locked)
+        this.releaseLock();
     }
+  }
+  acquireLockStrict(reclaimed = false) {
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
@@ -14397,22 +14493,22 @@ class DaemonLifecycle {
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
+        if (reclaimed)
+          return false;
         try {
           const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
-            this.log(`Stale lock file from dead process ${holderPid}, removing`);
+            this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
             this.releaseLock();
-            return this.acquireLock(depth + 1);
+            return this.acquireLockStrict(true);
           }
         } catch {
-          this.log("Cannot read lock file, removing stale lock");
-          this.releaseLock();
-          return this.acquireLock(depth + 1);
+          return false;
         }
         return false;
       }
-      this.log(`Warning: could not acquire startup lock: ${err.message}`);
-      return true;
+      this.log(`Could not acquire strict startup lock: ${err.message}`);
+      return false;
     }
   }
   releaseLock() {
@@ -14420,8 +14516,8 @@ class DaemonLifecycle {
       unlinkSync(this.stateDir.lockFile);
     } catch {}
   }
-  async kill(gracefulTimeoutMs = 3000) {
-    const pid = this.readPid();
+  async kill(gracefulTimeoutMs = 3000, pidOverride) {
+    const pid = pidOverride ?? this.readPid();
     if (!pid) {
       this.log("No daemon pid file found");
       this.cleanup();
@@ -14463,7 +14559,9 @@ class DaemonLifecycle {
   isDaemonProcess(pid) {
     try {
       const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-      return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
+      const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
+      const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+      return hasDaemonEntry && hasAgentbridge;
     } catch {
       return false;
     }
@@ -14471,7 +14569,6 @@ class DaemonLifecycle {
   cleanup() {
     this.removePidFile();
     this.removeStatusFile();
-    this.releaseLock();
   }
 }
 function isProcessAlive(pid) {
