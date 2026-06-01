@@ -4,12 +4,13 @@ import {
   writeSync,
   closeSync,
   writeFileSync,
+  readFileSync,
   unlinkSync,
   appendFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { ConfigService } from "../config-service";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { pairScopedCommand } from "../pair-command";
@@ -125,9 +126,40 @@ export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsR
   return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
 }
 
+/**
+ * Best-effort warning when the project's AGENTS.md has an AgentBridge marker block
+ * from an OLDER version that predates the collaboration contract now living in
+ * AGENTS.md. The daemon no longer appends that contract (message markers /
+ * git-write rules / role guidance) to every message, so an un-refreshed AGENTS.md
+ * would leave Codex without it. Read-only; never blocks startup; silent when there
+ * is no block (project simply hasn't been `abg init`-ed in this dir).
+ */
+function warnIfStaleAgentsMdContract(cwd: string): void {
+  try {
+    const agentsPath = join(cwd, "AGENTS.md");
+    if (!existsSync(agentsPath)) return;
+    const content = readFileSync(agentsPath, "utf-8");
+    if (!content.includes("<!-- AgentBridge:start -->")) return; // no block → not an upgrade-drift case
+    if (content.includes("Git operations — FORBIDDEN for you")) return; // already has the new contract
+    console.error(
+      "[agentbridge] ⚠️ Your AGENTS.md AgentBridge block predates the Codex collaboration contract " +
+        "(message markers / git-write rules / role guidance).",
+    );
+    console.error(
+      "[agentbridge]    Re-run `abg init` to refresh it — Codex now relies on AGENTS.md for that contract " +
+        "(it is no longer injected into every message).",
+    );
+  } catch {
+    /* best-effort; never block startup */
+  }
+}
+
 export async function runCodex(args: string[]) {
   // Strip `--pair <name>` first; the rest flows through to codex.
   const { pairFlag, rest } = parsePairFlag(args);
+
+  // Read-only nudge if this project's AGENTS.md contract block is stale (pre-upgrade).
+  warnIfStaleAgentsMdContract(process.cwd());
 
   // Check for owned flag conflicts (on the real codex args, not the pair flag).
   checkOwnedFlagConflicts(rest, "agentbridge codex", OWNED_FLAGS);

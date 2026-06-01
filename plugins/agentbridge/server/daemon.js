@@ -1642,27 +1642,6 @@ function classifyMessage(content, mode) {
       return { action: "forward", marker };
   }
 }
-var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers
-- [STATUS] for progress updates
-- [FYI] for background context
-The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
-Keep agentMessage for high-value communication only.
-
-[Git Operations \u2014 FORBIDDEN]
-You MUST NOT execute any git write commands. This includes but is not limited to:
-git commit, git push, git pull, git fetch, git checkout -b, git branch, git merge, git rebase, git cherry-pick, git tag, git stash.
-These commands write to the .git directory, which is blocked by your sandbox. Attempting them will cause your session to hang indefinitely.
-Read-only git commands (git status, git log, git diff, git show, git rev-parse) are allowed.
-All git write operations must be delegated to Claude Code via agentMessage. Report what you changed and let Claude handle branching, committing, and pushing.
-
-[Role Guidance for Codex]
-- Your default role: Implementer, Executor, Verifier
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
-- Do not blindly follow Claude - challenge with evidence when you disagree
-- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
 var REPLY_REQUIRED_INSTRUCTION = `
 
 [\u26A0\uFE0F REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement \u2014 do not skip or use [STATUS]/[FYI] markers for this reply.`;
@@ -2249,9 +2228,6 @@ var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
 var claudeDisconnectTimer = null;
-var claudeOnlineNoticeSent = false;
-var claudeOfflineNoticeShown = false;
-var codexCollaborationKickoffSent = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
@@ -2266,7 +2242,6 @@ var tuiConnectionState = new TuiConnectionState({
   },
   onReconnectAfterNotice: (connId) => {
     emitToClaude(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`));
-    codex.injectMessage("\u2705 Claude Code is still online, bridge restored. Bidirectional communication can continue.");
   }
 });
 var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
@@ -2321,18 +2296,12 @@ codex.on("turnCompleted", () => {
   replyReceivedDuringTurn = false;
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 });
 codex.on("tuiConnected", (connId) => {
   tuiConnectionState.handleTuiConnected(connId);
@@ -2355,8 +2324,6 @@ codex.on("exit", (code) => {
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  claudeOnlineNoticeSent = false;
-  claudeOfflineNoticeShown = false;
   emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
   broadcastStatus();
 });
@@ -2447,17 +2414,15 @@ function handleControlMessage(ws, raw) {
         return;
       }
       const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + `
-
-` + BRIDGE_CONTRACT_REMINDER;
+      let contentToSend = message.message.content;
       if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        contentToSend += REPLY_REQUIRED_INSTRUCTION;
         replyRequired = true;
         replyReceivedDuringTurn = false;
         log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
+      const injected = codex.injectMessage(contentToSend);
       if (!injected) {
         const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
@@ -2534,9 +2499,6 @@ async function attachClaude(ws) {
     }
   }
   lastAttachStatusSentTs = now;
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 }
 function detachClaude(ws, reason) {
   if (attachedClaude !== ws)
@@ -2652,17 +2614,6 @@ function scheduleClaudeDisconnectNotification(clientId) {
       log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
       return;
     }
-    if (!tuiConnectionState.canReply()) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`);
-      return;
-    }
-    if (!claudeOnlineNoticeSent) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`);
-      return;
-    }
-    codex.injectMessage("\u26A0\uFE0F Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
-    claudeOnlineNoticeSent = false;
-    claudeOfflineNoticeShown = true;
     log(`Claude disconnect persisted past grace window (client #${clientId})`);
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
@@ -2740,28 +2691,6 @@ ${attachCmd}`;
 }
 function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
-}
-function notifyCodexClaudeOnline() {
-  const message = !codexCollaborationKickoffSent ? [
-    "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
-    "You are now in a multi-agent collaboration session.",
-    "When you receive a complex task, propose a division of labor to Claude.",
-    "Claude can send you messages \u2014 they will appear as injected user messages.",
-    "Respond naturally and Claude will receive your output via AgentBridge."
-  ].join(`
-`) : "\u2705 AgentBridge connected to Claude Code.";
-  const delivered = codex.injectMessage(message);
-  if (!delivered) {
-    log("Deferred Claude-online notice to Codex \u2014 will retry after current turn completes");
-    return false;
-  }
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-  codexCollaborationKickoffSent = true;
-  return true;
-}
-function shouldNotifyCodexClaudeOnline() {
-  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 function systemMessage(idPrefix, content) {
   return {

@@ -4,7 +4,6 @@ import { appendFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import {
-  BRIDGE_CONTRACT_REMINDER,
   REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
   classifyMessage,
@@ -66,9 +65,6 @@ let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let claudeOnlineNoticeSent = false;
-let claudeOfflineNoticeShown = false;
-let codexCollaborationKickoffSent = false;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -104,7 +100,10 @@ const tuiConnectionState = new TuiConnectionState({
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
       ),
     );
-    codex.injectMessage("✅ Claude Code is still online, bridge restored. Bidirectional communication can continue.");
+    // No status notice injected into Codex: runtime online/offline/reconnect events
+    // can only go through turn/start, which pollutes the Codex thread/title and can
+    // trigger spurious responses (see the kickoff removal). Codex resumes normally
+    // on the next real Claude message.
   },
 });
 
@@ -188,11 +187,6 @@ codex.on("turnCompleted", () => {
     ),
   );
   startAttentionWindow();
-
-  // Retry Claude-online notice if it was deferred while the turn was in progress.
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 });
 
 codex.on("ready", (threadId: string) => {
@@ -203,10 +197,6 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
   );
-
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 });
 
 codex.on("tuiConnected", (connId: number) => {
@@ -233,8 +223,6 @@ codex.on("exit", (code: number | null) => {
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  claudeOnlineNoticeSent = false;
-  claudeOfflineNoticeShown = false;
   emitToClaude(
     systemMessage(
       "system_codex_exit",
@@ -339,15 +327,19 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       }
 
       const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
+      // The static bridge contract (markers / git-forbidden / role guidance) now
+      // lives in AGENTS.md (injected by `abg init`), so it is no longer appended to
+      // every message — appending it polluted every Codex turn and the thread title.
+      // Only the DYNAMIC reply-required instruction is appended, on demand.
+      let contentToSend = message.message.content;
       if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        contentToSend += REPLY_REQUIRED_INSTRUCTION;
         replyRequired = true;
         replyReceivedDuringTurn = false;
         log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
+      const injected = codex.injectMessage(contentToSend);
       if (!injected) {
         const reason = codex.turnInProgress
           ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
@@ -458,10 +450,6 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   }
 
   lastAttachStatusSentTs = now;
-
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 }
 
 function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
@@ -627,25 +615,10 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
       return;
     }
 
-    if (!tuiConnectionState.canReply()) {
-      log(
-        `Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`,
-      );
-      return;
-    }
-
-    if (!claudeOnlineNoticeSent) {
-      log(
-        `Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`,
-      );
-      return;
-    }
-
-    codex.injectMessage(
-      "⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.",
-    );
-    claudeOnlineNoticeSent = false;
-    claudeOfflineNoticeShown = true;
+    // Runtime offline events are no longer injected into Codex: the only channel
+    // (turn/start) pollutes the Codex thread/title and can trigger spurious
+    // responses. Logged for ops; Codex simply receives no further messages until
+    // Claude reconnects (the static collaboration context lives in AGENTS.md).
     log(`Claude disconnect persisted past grace window (client #${clientId})`);
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
@@ -733,33 +706,6 @@ function currentWaitingMessage() {
 
 function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
-}
-
-function notifyCodexClaudeOnline(): boolean {
-  const message = !codexCollaborationKickoffSent
-    ? [
-        "🤝 Claude Code has connected via AgentBridge.",
-        "You are now in a multi-agent collaboration session.",
-        "When you receive a complex task, propose a division of labor to Claude.",
-        "Claude can send you messages — they will appear as injected user messages.",
-        "Respond naturally and Claude will receive your output via AgentBridge.",
-      ].join("\n")
-    : "✅ AgentBridge connected to Claude Code.";
-
-  const delivered = codex.injectMessage(message);
-  if (!delivered) {
-    log("Deferred Claude-online notice to Codex — will retry after current turn completes");
-    return false;
-  }
-
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-  codexCollaborationKickoffSent = true;
-  return true;
-}
-
-function shouldNotifyCodexClaudeOnline() {
-  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
