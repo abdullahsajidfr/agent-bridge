@@ -1,14 +1,42 @@
 #!/usr/bin/env bun
 // @bun
 
-// src/daemon.ts
-import { appendFileSync as appendFileSync2 } from "fs";
+// src/build-info.ts
+function defineString(value, fallback) {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+function defineBundle(value) {
+  if (value === "source" || value === "dist" || value === "plugin")
+    return value;
+  return import.meta.url.endsWith(".ts") ? "source" : "dist";
+}
+function defineNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+var BUILD_INFO = Object.freeze({
+  version: defineString("0.1.6", "0.0.0-source"),
+  commit: defineString("6c24127", "source"),
+  bundle: defineBundle("plugin"),
+  contractVersion: defineNumber(1, 1)
+});
+function daemonStatusBuildInfo() {
+  return { ...BUILD_INFO };
+}
+function sameRuntimeContract(a, b) {
+  if (!a || !b)
+    return false;
+  return a.version === b.version && a.commit === b.commit && a.contractVersion === b.contractVersion;
+}
+function formatBuildInfo(build) {
+  if (!build)
+    return "<unknown>";
+  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;
+}
 
 // src/codex-adapter.ts
 import { spawn, execSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
-import { appendFileSync } from "fs";
 
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
@@ -51,6 +79,9 @@ class StateDirResolver {
   get portsFile() {
     return join(this.stateDir, "ports.json");
   }
+  get currentThreadFile() {
+    return join(this.stateDir, "current-thread.json");
+  }
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
   }
@@ -63,6 +94,40 @@ class StateDirResolver {
   get updateCheckFile() {
     return join(this.stateDir, "update-check.json");
   }
+}
+
+// src/rotating-log.ts
+import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, renameSync, statSync, unlinkSync } from "fs";
+import { dirname } from "path";
+var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
+var DEFAULT_KEEP = 3;
+function appendRotatingLog(path, content, options = {}) {
+  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  mkdirSync2(dirname(path), { recursive: true });
+  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
+  appendFileSync(path, content, "utf-8");
+}
+function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
+    return;
+  if (!existsSync2(path))
+    return;
+  const size = statSync(path).size;
+  if (size + incomingBytes <= maxBytes)
+    return;
+  for (let index = keep;index >= 1; index--) {
+    const current = `${path}.${index}`;
+    const next = `${path}.${index + 1}`;
+    if (!existsSync2(current))
+      continue;
+    if (index === keep) {
+      unlinkSync(current);
+    } else {
+      renameSync(current, next);
+    }
+  }
+  renameSync(path, `${path}.1`);
 }
 
 // src/app-server-protocol.ts
@@ -111,7 +176,7 @@ function isAppServerResponseMessage(value) {
 // src/codex-transport.ts
 import { createServer, connect } from "net";
 import { spawnSync } from "child_process";
-import { mkdirSync as mkdirSync2, rmSync, chmodSync } from "fs";
+import { mkdirSync as mkdirSync3, rmSync, chmodSync } from "fs";
 import { join as join2 } from "path";
 import { tmpdir } from "os";
 var CODEX_TRANSPORT_ENV = "AGENTBRIDGE_CODEX_TRANSPORT";
@@ -172,7 +237,7 @@ function ensureSocketDir(socketPath) {
   const dir = socketPath.slice(0, socketPath.lastIndexOf("/"));
   if (!dir)
     return;
-  mkdirSync2(dir, { recursive: true, mode: 448 });
+  mkdirSync3(dir, { recursive: true, mode: 448 });
   try {
     chmodSync(dir, 448);
   } catch (err) {
@@ -357,6 +422,7 @@ class CodexAdapter extends EventEmitter {
   activeTurnIds = new Set;
   turnInProgress = false;
   turnWatchdogs = new Map;
+  stalledTurnIds = new Set;
   threadSwitchSeq = 0;
   nextProxyId = 1e5;
   upstreamToClient = new Map;
@@ -847,7 +913,13 @@ class CodexAdapter extends EventEmitter {
   }
   setupSecondaryConnection(ws, connId) {
     const appWs = new WebSocket(this.appServerUrl);
-    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] };
+    const entry = {
+      tuiWs: ws,
+      appServerWs: appWs,
+      buffer: [],
+      initialized: false,
+      initializationReplayed: false
+    };
     this.secondaryConnections.set(connId, entry);
     appWs.onopen = () => {
       if (!this.secondaryConnections.has(connId)) {
@@ -969,13 +1041,13 @@ class CodexAdapter extends EventEmitter {
     const connId = ws.data.connId;
     const secondary = this.secondaryConnections.get(connId);
     if (secondary) {
-      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
-        try {
-          secondary.appServerWs.send(data);
-        } catch {}
-      } else {
-        secondary.buffer.push(data);
+      const method = this.detectJsonMethod(data);
+      if (method === "initialize" || method === "initialized") {
+        secondary.initialized = true;
+      } else if (!secondary.initialized) {
+        this.ensureSecondaryInitialized(secondary, connId);
       }
+      this.sendOrBufferSecondary(secondary, data);
       return;
     }
     if (connId !== this.tuiConnId) {
@@ -1064,6 +1136,38 @@ class CodexAdapter extends EventEmitter {
       this.appServerWs.send(forwarded);
     } else {
       this.log(`WARNING: app-server closed between OPEN check and send \u2014 message lost (connId=${ws.data.connId})`);
+    }
+  }
+  detectJsonMethod(raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed?.method === "string" ? parsed.method : undefined;
+    } catch {
+      return;
+    }
+  }
+  ensureSecondaryInitialized(secondary, connId) {
+    if (secondary.initializationReplayed)
+      return;
+    secondary.initializationReplayed = true;
+    if (!this.lastInitializeRaw) {
+      this.log(`Secondary conn #${connId}: no cached initialize available before first non-initialize request`);
+      return;
+    }
+    this.log(`Secondary conn #${connId}: replaying cached initialize before picker request`);
+    this.sendOrBufferSecondary(secondary, this.lastInitializeRaw);
+    if (this.lastInitializedRaw) {
+      this.sendOrBufferSecondary(secondary, this.lastInitializedRaw);
+    }
+    secondary.initialized = true;
+  }
+  sendOrBufferSecondary(secondary, raw) {
+    if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+      try {
+        secondary.appServerWs.send(raw);
+      } catch {}
+    } else {
+      secondary.buffer.push(raw);
     }
   }
   handleAppServerPayload(raw) {
@@ -1185,6 +1289,7 @@ class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1371,6 +1476,7 @@ class CodexAdapter extends EventEmitter {
       return;
     const previousThreadId = this.threadId;
     this.threadId = threadId;
+    this.emit("threadChanged", { threadId, previousThreadId, reason });
     if (previousThreadId) {
       this.log(`Active thread changed: ${previousThreadId} \u2192 ${threadId} (${reason})`);
       return;
@@ -1382,6 +1488,7 @@ class CodexAdapter extends EventEmitter {
     const wasInProgress = this.turnInProgress;
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
     this.activeTurnIds.add(turnKey);
+    this.stalledTurnIds.delete(turnKey);
     this.scheduleTurnWatchdog(turnKey);
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
@@ -1392,9 +1499,11 @@ class CodexAdapter extends EventEmitter {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
       this.clearTurnWatchdog(turnId);
+      this.stalledTurnIds.delete(turnId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
+      this.stalledTurnIds.clear();
     }
     this.turnInProgress = this.activeTurnIds.size > 0;
   }
@@ -1407,8 +1516,8 @@ class CodexAdapter extends EventEmitter {
     const timer = setTimeout(() => {
       if (!this.activeTurnIds.has(turnKey))
         return;
-      this.log(`WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity \u2014 ` + `assuming a lost turn/completed; force-completing to unblock injection`);
-      this.forceCompleteTurn(turnKey);
+      this.log(`WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity \u2014 ` + `marking stalled but keeping Codex busy until a real completion or reconnect`);
+      this.markTurnStalled(turnKey);
     }, this.turnWatchdogMs());
     timer.unref?.();
     this.turnWatchdogs.set(turnKey, timer);
@@ -1432,24 +1541,30 @@ class CodexAdapter extends EventEmitter {
       this.scheduleTurnWatchdog(turnKey);
     }
   }
-  forceCompleteTurn(turnKey) {
-    const wasInProgress = this.turnInProgress;
-    this.activeTurnIds.delete(turnKey);
-    this.clearTurnWatchdog(turnKey);
-    this.turnInProgress = this.activeTurnIds.size > 0;
-    if (wasInProgress && !this.turnInProgress) {
-      this.emit("turnCompleted");
-    }
+  markTurnStalled(turnKey) {
+    if (!this.activeTurnIds.has(turnKey))
+      return;
+    this.turnInProgress = true;
+    if (this.stalledTurnIds.has(turnKey))
+      return;
+    this.stalledTurnIds.add(turnKey);
+    this.emit("turnStalled", {
+      turnId: turnKey,
+      inactivityMs: this.turnWatchdogMs()
+    });
   }
   resetTurnState(reason, emitCompleted = false) {
     const wasInProgress = this.turnInProgress;
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();
+    this.stalledTurnIds.clear();
     this.turnInProgress = false;
-    if (emitCompleted && wasInProgress) {
-      this.emit("turnCompleted");
-    }
     if (wasInProgress) {
+      if (emitCompleted) {
+        this.emit("turnCompleted");
+      } else {
+        this.emit("turnAborted", reason);
+      }
       this.log(`Turn state reset (${reason})`);
     }
   }
@@ -1611,9 +1726,39 @@ class CodexAdapter extends EventEmitter {
 `;
     process.stderr.write(line);
     try {
-      appendFileSync(this.logFile, line);
+      appendRotatingLog(this.logFile, line);
     } catch {}
   }
+}
+
+// src/control-protocol.ts
+var CLOSE_CODE_REPLACED = 4001;
+var CLOSE_CODE_EVICTED_STALE = 4002;
+var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+var CLOSE_CODE_PAIR_MISMATCH = 4004;
+
+// src/daemon-identity.ts
+function validateClaudeClientIdentity(input) {
+  if (!input.expectedPairId)
+    return { ok: true };
+  if (!input.identity) {
+    return input.allowIdentityless ? { ok: true } : { ok: false, closeCode: CLOSE_CODE_PAIR_MISMATCH, reason: "missing client identity" };
+  }
+  if (input.identity.pairId !== input.expectedPairId) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_PAIR_MISMATCH,
+      reason: `pair mismatch: expected ${input.expectedPairId}, got ${input.identity.pairId ?? "<none>"}`
+    };
+  }
+  if (!input.identity.cwd || input.identity.cwd !== input.daemonCwd) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_PAIR_MISMATCH,
+      reason: `cwd mismatch: expected ${input.daemonCwd}, got ${input.identity.cwd ?? "<none>"}`
+    };
+  }
+  return { ok: true };
 }
 
 // src/message-filter.ts
@@ -1798,7 +1943,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/env-utils.ts
@@ -1820,6 +1965,7 @@ var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 var REUSE_READY_DELAY_MS = 250;
+var HEALTH_FETCH_TIMEOUT_MS = 500;
 
 class DaemonLifecycle {
   stateDir;
@@ -1844,7 +1990,7 @@ class DaemonLifecycle {
   }
   async fetchStatus() {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       if (!response.ok)
         return null;
       return await response.json();
@@ -1863,11 +2009,24 @@ class DaemonLifecycle {
       return true;
     return reported !== expected;
   }
+  isBuildDrifted(status) {
+    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1")
+      return false;
+    const runtime = status?.build;
+    if (!runtime)
+      return true;
+    return !sameRuntimeContract(runtime, BUILD_INFO);
+  }
   async ensureRunning() {
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
       if (this.isForeignDaemon(status)) {
         this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
+        await this.replaceUnhealthyDaemon(status?.pid);
+        return;
+      }
+      if (this.isBuildDrifted(status)) {
+        this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
         await this.replaceUnhealthyDaemon(status?.pid);
         return;
       }
@@ -1903,11 +2062,20 @@ class DaemonLifecycle {
         await this.waitForReadyAndOurs();
         return;
       }
-      if (await this.isHealthy() && !this.isForeignDaemon(await this.fetchStatus())) {
-        try {
-          await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
-          return;
-        } catch {}
+      if (await this.isHealthy()) {
+        const status = await this.fetchStatus();
+        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+          this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) \u2014 replacing`);
+          await this.kill(3000, status?.pid);
+        } else {
+          try {
+            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            return;
+          } catch {
+            this.log(`Daemon on control port ${this.controlPort} is healthy but not ready under startup lock \u2014 replacing`);
+            await this.kill(3000, status?.pid);
+          }
+        }
       }
       this.launch();
       await this.waitForReady();
@@ -1915,7 +2083,7 @@ class DaemonLifecycle {
   }
   async isHealthy() {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       return response.ok;
     } catch {
       return false;
@@ -1931,7 +2099,7 @@ class DaemonLifecycle {
   }
   async isReady() {
     try {
-      const response = await fetch(this.readyUrl);
+      const response = await fetchWithTimeout(this.readyUrl);
       return response.ok;
     } catch {
       return false;
@@ -1949,7 +2117,7 @@ class DaemonLifecycle {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status))
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status))
           return;
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -1987,12 +2155,12 @@ class DaemonLifecycle {
   }
   removePidFile() {
     try {
-      unlinkSync(this.stateDir.pidFile);
+      unlinkSync2(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync(this.stateDir.statusFile);
+      unlinkSync2(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
@@ -2002,11 +2170,11 @@ class DaemonLifecycle {
   }
   clearKilled() {
     try {
-      unlinkSync(this.stateDir.killedFile);
+      unlinkSync2(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
-    return existsSync2(this.stateDir.killedFile);
+    return existsSync3(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -2036,7 +2204,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status)) {
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -2088,7 +2256,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync(this.stateDir.lockFile);
+      unlinkSync2(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000, pidOverride) {
@@ -2146,6 +2314,15 @@ class DaemonLifecycle {
     this.removeStatusFile();
   }
 }
+async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -2156,7 +2333,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
 import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -2213,7 +2390,7 @@ class ConfigService {
     this.configPath = join3(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync3(this.configPath);
+    return existsSync4(this.configPath);
   }
   load() {
     try {
@@ -2234,7 +2411,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync3(this.configPath)) {
+    if (!existsSync4(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -2244,16 +2421,166 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync3(this.configDir)) {
-      mkdirSync3(this.configDir, { recursive: true });
+    if (!existsSync4(this.configDir)) {
+      mkdirSync4(this.configDir, { recursive: true });
     }
   }
 }
 
-// src/control-protocol.ts
-var CLOSE_CODE_REPLACED = 4001;
-var CLOSE_CODE_EVICTED_STALE = 4002;
-var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+// src/reply-required-tracker.ts
+class ReplyRequiredTracker {
+  armed = false;
+  forwardedDuringTurn = false;
+  get isArmed() {
+    return this.armed;
+  }
+  arm() {
+    this.armed = true;
+    this.forwardedDuringTurn = false;
+  }
+  noteForwarded() {
+    if (this.armed)
+      this.forwardedDuringTurn = true;
+  }
+  consumeOnTurnComplete() {
+    const warnReplyMissing = this.armed && !this.forwardedDuringTurn;
+    this.reset();
+    return { warnReplyMissing };
+  }
+  reset() {
+    this.armed = false;
+    this.forwardedDuringTurn = false;
+  }
+}
+
+// src/thread-state.ts
+import {
+  existsSync as existsSync5,
+  mkdirSync as mkdirSync5,
+  readdirSync,
+  readFileSync as readFileSync3,
+  renameSync as renameSync2,
+  writeFileSync as writeFileSync3
+} from "fs";
+import { homedir as homedir2 } from "os";
+import { basename, dirname as dirname2, join as join4 } from "path";
+function nowIso() {
+  return new Date().toISOString();
+}
+function threadTag(identity) {
+  const name = identity.pairName ?? identity.pairId ?? "manual";
+  return `abg:${name}:${identity.cwd}`;
+}
+function codexHome(env = process.env) {
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join4(homedir2(), ".codex");
+}
+function atomicWriteJson(path, value) {
+  mkdirSync5(dirname2(path), { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync3(tmp, JSON.stringify(value, null, 2) + `
+`, "utf-8");
+  renameSync2(tmp, path);
+}
+function readRawCurrentThread(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync3(stateDir.currentThreadFile, "utf-8"));
+    if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
+  const sessionsDir = join4(codexHome(env), "sessions");
+  if (!threadId || !existsSync5(sessionsDir))
+    return null;
+  const exactName = `rollout-${threadId}.jsonl`;
+  const stack = [sessionsDir];
+  let visited = 0;
+  while (stack.length > 0 && visited < maxEntries) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited++;
+      const path = join4(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(path);
+        continue;
+      }
+      if (!entry.isFile())
+        continue;
+      const name = basename(entry.name);
+      if (name === exactName || name.startsWith("rollout-") && name.endsWith(".jsonl") && name.includes(threadId)) {
+        return path;
+      }
+    }
+  }
+  return null;
+}
+function writePendingCurrentThread(identity, threadId, reason) {
+  const state = {
+    version: 1,
+    status: "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity)
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+function promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env = process.env) {
+  const rolloutPath = findCodexRolloutFile(threadId, env);
+  const state = {
+    version: 1,
+    status: rolloutPath ? "current" : "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity),
+    ...rolloutPath ? { rolloutPath, rolloutVerifiedAt: nowIso() } : {}
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+async function persistCurrentThreadWithRolloutRetry(identity, threadId, reason, options = {}) {
+  const env = options.env ?? process.env;
+  const attempts = options.attempts ?? 20;
+  const delayMs = options.delayMs ?? 250;
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  if (!shouldContinue())
+    return null;
+  writePendingCurrentThread(identity, threadId, reason);
+  for (let attempt = 1;attempt <= attempts; attempt++) {
+    if (!shouldContinue()) {
+      options.log?.(`Abandoned current-thread persistence for ${threadId}: a newer thread became active`);
+      return null;
+    }
+    const state = promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env);
+    if (state.status === "current") {
+      options.log?.(`Current Codex thread persisted: ${threadId} (${state.rolloutPath})`);
+      return state;
+    }
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  if (!shouldContinue())
+    return null;
+  options.log?.(`Current Codex thread left pending because no rollout file was found: ${threadId}`);
+  return readRawCurrentThread(identity.stateDir) ?? writePendingCurrentThread(identity, threadId, reason);
+}
 
 // src/liveness-probe.ts
 var OPEN = 1;
@@ -2299,6 +2626,7 @@ var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? Stri
 var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
 var BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS", 45000);
 var CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
+var ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -2309,8 +2637,7 @@ var nextSystemMessageId = 0;
 var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
-var replyRequired = false;
-var replyReceivedDuringTurn = false;
+var replyTracker = new ReplyRequiredTracker;
 var shuttingDown = false;
 var bootDeadlineTimer = null;
 var idleShutdownTimer = null;
@@ -2340,9 +2667,9 @@ codex.on("agentMessage", (msg) => {
   if (msg.source !== "codex")
     return;
   const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyRequired) {
+  if (replyTracker.isArmed) {
     log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
-    replyReceivedDuringTurn = true;
+    replyTracker.noteForwarded();
     if (statusBuffer.size > 0) {
       statusBuffer.flush("reply-required message arrived");
     }
@@ -2375,20 +2702,41 @@ codex.on("agentMessage", (msg) => {
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
-  if (replyRequired && !replyReceivedDuringTurn) {
+  const { warnReplyMissing } = replyTracker.consumeOnTurnComplete();
+  if (warnReplyMissing) {
     log("\u26A0\uFE0F Reply was required but Codex did not send any agentMessage");
     emitToClaude(systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase."));
   }
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
+});
+codex.on("turnAborted", (reason) => {
+  log(`Codex turn aborted (${reason}) \u2014 clearing reply-required state`);
+  replyTracker.reset();
+});
+codex.on("turnStalled", (event) => {
+  log(`Codex turn stalled (${event.turnId}, inactivity ${event.inactivityMs}ms)`);
+  emitToClaude(systemMessage("system_turn_stalled", `\u26A0\uFE0F Codex has been silent for ${event.inactivityMs}ms while a turn is still in progress. AgentBridge is keeping the turn busy and will not send a fake completion; wait for Codex to finish or reconnect the TUI if it is stuck.`));
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
+});
+codex.on("threadChanged", (event) => {
+  broadcastStatus();
+  persistCurrentThreadWithRolloutRetry({
+    stateDir,
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    pairName: process.env.AGENTBRIDGE_PAIR_NAME,
+    cwd: process.cwd()
+  }, event.threadId, event.reason, {
+    log,
+    shouldContinue: () => codex.activeThreadId === event.threadId
+  }).catch((err) => {
+    log(`Failed to persist current thread ${event.threadId}: ${err?.message ?? err}`);
+  });
 });
 codex.on("tuiConnected", (connId) => {
   tuiConnectionState.handleTuiConnected(connId);
@@ -2408,6 +2756,7 @@ codex.on("error", (err) => {
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
+  replyTracker.reset();
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -2467,7 +2816,18 @@ function handleControlMessage(ws, raw) {
   }
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws).catch((err) => {
+      const admission = validateClaudeClientIdentity({
+        expectedPairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+        daemonCwd: process.cwd(),
+        identity: message.identity,
+        allowIdentityless: ALLOW_IDENTITYLESS_CLIENT
+      });
+      if (!admission.ok) {
+        log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);
+        ws.close(admission.closeCode, admission.reason);
+        return;
+      }
+      attachClaude(ws, message.identity).catch((err) => {
         log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
@@ -2505,9 +2865,6 @@ function handleControlMessage(ws, raw) {
       let contentToSend = message.message.content;
       if (requireReply) {
         contentToSend += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentToSend);
@@ -2522,6 +2879,10 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
+      if (requireReply) {
+        replyTracker.arm();
+        log(`Reply required flag set for this message`);
+      }
       clearAttentionWindow();
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
@@ -2532,7 +2893,7 @@ function handleControlMessage(ws, raw) {
     }
   }
 }
-async function attachClaude(ws) {
+async function attachClaude(ws, identity) {
   const occupant = attachedClaude;
   if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
     const msSincePong = Date.now() - occupant.data.lastPongAt;
@@ -2569,10 +2930,11 @@ async function attachClaude(ws) {
     return;
   }
   clearPendingClaudeDisconnect("Claude frontend attached");
+  ws.data.identity = identity;
   attachedClaude = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
+  log(`Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`);
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
   const now = Date.now();
@@ -2771,7 +3133,10 @@ function currentStatus() {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
-    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo()
   };
 }
 function currentWaitingMessage() {
@@ -2801,7 +3166,10 @@ function writeStatusFile() {
     appServerUrl: codex.appServerUrl,
     controlPort: CONTROL_PORT,
     pid: process.pid,
-    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo()
   });
 }
 function removeStatusFile() {
@@ -2891,7 +3259,7 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(stateDir.logFile, line);
+    appendRotatingLog(stateDir.logFile, line);
   } catch {}
 }
 if (daemonLifecycle.wasKilled()) {

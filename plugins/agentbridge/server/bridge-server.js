@@ -6517,9 +6517,6 @@ var require_dist = __commonJS((exports, module) => {
   exports.default = formatsPlugin;
 });
 
-// src/bridge.ts
-import { appendFileSync as appendFileSync2 } from "fs";
-
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
@@ -13662,10 +13659,43 @@ class StdioServerTransport {
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
-import { appendFileSync } from "fs";
+
+// src/rotating-log.ts
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
+import { dirname } from "path";
+var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
+var DEFAULT_KEEP = 3;
+function appendRotatingLog(path, content, options = {}) {
+  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  mkdirSync(dirname(path), { recursive: true });
+  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
+  appendFileSync(path, content, "utf-8");
+}
+function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
+    return;
+  if (!existsSync(path))
+    return;
+  const size = statSync(path).size;
+  if (size + incomingBytes <= maxBytes)
+    return;
+  for (let index = keep;index >= 1; index--) {
+    const current = `${path}.${index}`;
+    const next = `${path}.${index + 1}`;
+    if (!existsSync(current))
+      continue;
+    if (index === keep) {
+      unlinkSync(current);
+    } else {
+      renameSync(current, next);
+    }
+  }
+  renameSync(path, `${path}.1`);
+}
 
 // src/state-dir.ts
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -13683,8 +13713,8 @@ class StateDirResolver {
     this.stateDir = override && override.length > 0 ? override : StateDirResolver.platformBaseDir();
   }
   ensure() {
-    if (!existsSync(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
+    if (!existsSync2(this.stateDir)) {
+      mkdirSync2(this.stateDir, { recursive: true });
     }
   }
   get dir() {
@@ -13704,6 +13734,9 @@ class StateDirResolver {
   }
   get portsFile() {
     return join(this.stateDir, "ports.json");
+  }
+  get currentThreadFile() {
+    return join(this.stateDir, "current-thread.json");
   }
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
@@ -13987,9 +14020,38 @@ ${formatted}`
 `;
     process.stderr.write(line);
     try {
-      appendFileSync(this.logFile, line);
+      appendRotatingLog(this.logFile, line);
     } catch {}
   }
+}
+
+// src/build-info.ts
+function defineString(value, fallback) {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+function defineBundle(value) {
+  if (value === "source" || value === "dist" || value === "plugin")
+    return value;
+  return import.meta.url.endsWith(".ts") ? "source" : "dist";
+}
+function defineNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+var BUILD_INFO = Object.freeze({
+  version: defineString("0.1.6", "0.0.0-source"),
+  commit: defineString("6c24127", "source"),
+  bundle: defineBundle("plugin"),
+  contractVersion: defineNumber(1, 1)
+});
+function sameRuntimeContract(a, b) {
+  if (!a || !b)
+    return false;
+  return a.version === b.version && a.commit === b.commit && a.contractVersion === b.contractVersion;
+}
+function formatBuildInfo(build) {
+  if (!build)
+    return "<unknown>";
+  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;
 }
 
 // src/daemon-client.ts
@@ -13999,19 +14061,22 @@ import { EventEmitter as EventEmitter2 } from "events";
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+var CLOSE_CODE_PAIR_MISMATCH = 4004;
 
 // src/daemon-client.ts
 var nextSocketId = 0;
 
 class DaemonClient extends EventEmitter2 {
   url;
+  options;
   ws = null;
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
-  constructor(url) {
+  constructor(url, options = {}) {
     super();
     this.url = url;
+    this.options = options;
   }
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -14053,11 +14118,14 @@ class DaemonClient extends EventEmitter2 {
     });
   }
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    this.send({
+      type: "claude_connect",
+      ...this.options.identity ? { identity: this.options.identity } : {}
+    });
   }
   async attachClaudeAndWaitForStatus(timeoutMs = 1000) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
+      return null;
     }
     return await new Promise((resolve) => {
       let settled = false;
@@ -14078,19 +14146,19 @@ class DaemonClient extends EventEmitter2 {
         cleanup();
         resolve(value);
       };
-      const onStatus = () => finish(true);
-      const onRejected = () => finish(false);
-      const onDisconnect = () => finish(false);
+      const onStatus = (status) => finish(status);
+      const onRejected = () => finish(null);
+      const onDisconnect = () => finish(null);
       this.on("status", onStatus);
       this.on("rejected", onRejected);
       this.on("disconnect", onDisconnect);
       timer = setTimeout(() => {
-        finish(false);
+        finish(null);
       }, timeoutMs);
       try {
         this.attachClaude();
       } catch {
-        finish(false);
+        finish(null);
       }
     });
   }
@@ -14193,7 +14261,7 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS) {
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PAIR_MISMATCH) {
           this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
@@ -14223,7 +14291,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/env-utils.ts
@@ -14245,6 +14313,7 @@ var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 var REUSE_READY_DELAY_MS = 250;
+var HEALTH_FETCH_TIMEOUT_MS = 500;
 
 class DaemonLifecycle {
   stateDir;
@@ -14269,7 +14338,7 @@ class DaemonLifecycle {
   }
   async fetchStatus() {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       if (!response.ok)
         return null;
       return await response.json();
@@ -14288,11 +14357,24 @@ class DaemonLifecycle {
       return true;
     return reported !== expected;
   }
+  isBuildDrifted(status) {
+    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1")
+      return false;
+    const runtime = status?.build;
+    if (!runtime)
+      return true;
+    return !sameRuntimeContract(runtime, BUILD_INFO);
+  }
   async ensureRunning() {
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
       if (this.isForeignDaemon(status)) {
         this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
+        await this.replaceUnhealthyDaemon(status?.pid);
+        return;
+      }
+      if (this.isBuildDrifted(status)) {
+        this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
         await this.replaceUnhealthyDaemon(status?.pid);
         return;
       }
@@ -14328,11 +14410,20 @@ class DaemonLifecycle {
         await this.waitForReadyAndOurs();
         return;
       }
-      if (await this.isHealthy() && !this.isForeignDaemon(await this.fetchStatus())) {
-        try {
-          await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
-          return;
-        } catch {}
+      if (await this.isHealthy()) {
+        const status = await this.fetchStatus();
+        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+          this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) \u2014 replacing`);
+          await this.kill(3000, status?.pid);
+        } else {
+          try {
+            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            return;
+          } catch {
+            this.log(`Daemon on control port ${this.controlPort} is healthy but not ready under startup lock \u2014 replacing`);
+            await this.kill(3000, status?.pid);
+          }
+        }
       }
       this.launch();
       await this.waitForReady();
@@ -14340,7 +14431,7 @@ class DaemonLifecycle {
   }
   async isHealthy() {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       return response.ok;
     } catch {
       return false;
@@ -14356,7 +14447,7 @@ class DaemonLifecycle {
   }
   async isReady() {
     try {
-      const response = await fetch(this.readyUrl);
+      const response = await fetchWithTimeout(this.readyUrl);
       return response.ok;
     } catch {
       return false;
@@ -14374,7 +14465,7 @@ class DaemonLifecycle {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status))
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status))
           return;
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -14412,12 +14503,12 @@ class DaemonLifecycle {
   }
   removePidFile() {
     try {
-      unlinkSync(this.stateDir.pidFile);
+      unlinkSync2(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync(this.stateDir.statusFile);
+      unlinkSync2(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
@@ -14427,11 +14518,11 @@ class DaemonLifecycle {
   }
   clearKilled() {
     try {
-      unlinkSync(this.stateDir.killedFile);
+      unlinkSync2(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
-    return existsSync2(this.stateDir.killedFile);
+    return existsSync3(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -14461,7 +14552,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status)) {
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -14513,7 +14604,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync(this.stateDir.lockFile);
+      unlinkSync2(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000, pidOverride) {
@@ -14571,6 +14662,15 @@ class DaemonLifecycle {
     this.removeStatusFile();
   }
 }
+async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -14581,7 +14681,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -14638,7 +14738,7 @@ class ConfigService {
     this.configPath = join2(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync3(this.configPath);
+    return existsSync4(this.configPath);
   }
   load() {
     try {
@@ -14659,7 +14759,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync3(this.configPath)) {
+    if (!existsSync4(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -14669,8 +14769,8 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+    if (!existsSync4(this.configDir)) {
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
@@ -14678,18 +14778,19 @@ class ConfigService {
 // src/pair-registry.ts
 import {
   closeSync as closeSync2,
-  existsSync as existsSync4,
+  existsSync as existsSync5,
   fsyncSync,
   linkSync,
-  mkdirSync as mkdirSync3,
+  mkdirSync as mkdirSync4,
   openSync as openSync2,
   readFileSync as readFileSync3,
   realpathSync,
-  renameSync,
-  statSync,
-  unlinkSync as unlinkSync2,
+  renameSync as renameSync2,
+  statSync as statSync2,
+  unlinkSync as unlinkSync3,
   writeFileSync as writeFileSync3
 } from "fs";
+import { createHash, randomUUID as randomUUID2 } from "crypto";
 import { basename, join as join3 } from "path";
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
@@ -14706,6 +14807,17 @@ class PairError extends Error {
   }
 }
 var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
+function derivePairId(cwd, name) {
+  let real;
+  try {
+    real = realpathSync(cwd);
+  } catch {
+    real = cwd;
+  }
+  const hash = createHash("sha256").update(real).update("\x00").update(name.toLowerCase()).digest("hex").slice(0, 8);
+  const slug = name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "pair";
+  return `${slug}-${hash}`;
+}
 function pairsDir(base) {
   return join3(base, "pairs");
 }
@@ -14714,7 +14826,7 @@ function registryPath(base) {
 }
 function readRegistry(base) {
   const path = registryPath(base);
-  if (!existsSync4(path))
+  if (!existsSync5(path))
     return { version: 1, pairs: [] };
   let parsed;
   try {
@@ -14791,7 +14903,176 @@ function disabledReplyError(reason) {
   }
 }
 
+// src/env-guard.ts
+var GENERATED_ENV_KEYS = [
+  "AGENTBRIDGE_BASE_DIR",
+  "AGENTBRIDGE_PAIR_ID",
+  "AGENTBRIDGE_PAIR_NAME",
+  "AGENTBRIDGE_STATE_DIR",
+  "AGENTBRIDGE_CONTROL_PORT",
+  "AGENTBRIDGE_MODE",
+  "AGENTBRIDGE_FILTER_MODE",
+  "AGENTBRIDGE_MAX_BUFFERED_MESSAGES",
+  "AGENTBRIDGE_CODEX_TRANSPORT",
+  "CODEX_WS_PORT",
+  "CODEX_PROXY_PORT"
+];
+function normalizeEnvGuardMode(raw, fallback = "fix") {
+  if (raw === "off" || raw === "warn" || raw === "fix" || raw === "strict")
+    return raw;
+  return fallback;
+}
+function inspectAgentBridgeEnv(opts) {
+  const env = opts.env ?? process.env;
+  const actualPairId = nonEmpty(env.AGENTBRIDGE_PAIR_ID);
+  const pairName = nonEmpty(env.AGENTBRIDGE_PAIR_NAME) ?? "main";
+  const stateDir = nonEmpty(env.AGENTBRIDGE_STATE_DIR);
+  const baseDir = nonEmpty(env.AGENTBRIDGE_BASE_DIR);
+  const manualOptIn = env.AGENTBRIDGE_MANUAL === "1";
+  const manualRuntimeEnv = !!stateDir || !!nonEmpty(env.AGENTBRIDGE_CONTROL_PORT) || !!nonEmpty(env.CODEX_WS_PORT) || !!nonEmpty(env.CODEX_PROXY_PORT);
+  const expectedPairId = actualPairId ? derivePairId(opts.cwd, pairName) : null;
+  const reasons = [];
+  if (!actualPairId && manualRuntimeEnv && !manualOptIn) {
+    reasons.push("AgentBridge runtime env is set without AGENTBRIDGE_PAIR_ID or AGENTBRIDGE_MANUAL=1");
+  }
+  if (actualPairId && expectedPairId && actualPairId !== expectedPairId) {
+    reasons.push(`AGENTBRIDGE_PAIR_ID=${actualPairId} does not match cwd-derived ${expectedPairId}`);
+  }
+  if (actualPairId && stateDir && !stateDir.endsWith(`/pairs/${actualPairId}`)) {
+    reasons.push(`AGENTBRIDGE_STATE_DIR does not end with /pairs/${actualPairId}`);
+  }
+  if (actualPairId && baseDir && stateDir && !stateDir.startsWith(`${baseDir}/`)) {
+    reasons.push("AGENTBRIDGE_BASE_DIR and AGENTBRIDGE_STATE_DIR disagree");
+  }
+  return {
+    ok: reasons.length === 0,
+    expectedPairId,
+    actualPairId,
+    pairName,
+    reasons
+  };
+}
+function guardAgentBridgeEnv(opts) {
+  const env = opts.env ?? process.env;
+  const mode = normalizeEnvGuardMode(opts.mode, "fix");
+  const effectiveMode = mode === "strict" && opts.allowStrict === false ? "fix" : mode;
+  const inspection = inspectAgentBridgeEnv({ cwd: opts.cwd, env });
+  if (effectiveMode === "off" || inspection.ok) {
+    return { ...inspection, action: "none" };
+  }
+  const message = `stale AgentBridge environment detected for ${opts.cwd}: ${inspection.reasons.join("; ")}`;
+  if (effectiveMode === "strict") {
+    throw new Error(message);
+  }
+  opts.log?.(`[agentbridge] ${message}`);
+  if (effectiveMode === "warn") {
+    return { ...inspection, action: "warned" };
+  }
+  for (const key of GENERATED_ENV_KEYS) {
+    delete env[key];
+  }
+  opts.log?.("[agentbridge] cleared stale AgentBridge environment variables");
+  return { ...inspection, action: "fixed" };
+}
+function nonEmpty(value) {
+  return value && value.length > 0 ? value : null;
+}
+
+// src/trace-log.ts
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync5 } from "fs";
+import { join as join4 } from "path";
+var SECRET_KEY_RE = /(token|secret|password|passwd|api[_-]?key|auth|cookie|session)/i;
+var SECRET_ARG_RE = /^--?(?:token|secret|password|passwd|apikey|api-key|api_key|auth|cookie|session)(?:=.*)?$/i;
+var RELEVANT_ENV_RE = /^(AGENTBRIDGE_|CODEX_)/;
+function pickRelevantEnv(env) {
+  const picked = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!RELEVANT_ENV_RE.test(key))
+      continue;
+    picked[key] = SECRET_KEY_RE.test(key) && value !== undefined ? "<redacted>" : value;
+  }
+  return picked;
+}
+function redactArgv(argv) {
+  const redacted = [];
+  let redactNext = false;
+  for (const arg of argv) {
+    if (redactNext) {
+      redacted.push("<redacted>");
+      redactNext = false;
+      continue;
+    }
+    if (SECRET_ARG_RE.test(arg)) {
+      if (arg.includes("=")) {
+        const [key] = arg.split("=", 1);
+        redacted.push(`${key}=<redacted>`);
+      } else {
+        redacted.push(arg);
+        redactNext = true;
+      }
+      continue;
+    }
+    redacted.push(arg);
+  }
+  return redacted;
+}
+function traceLogPath(cwd, timestamp) {
+  const day = timestamp.slice(0, 10);
+  return join4(cwd, ".agentbridge", "logs", `trace-${day}.jsonl`);
+}
+function appendTraceEvent(input) {
+  const timestamp = input.timestamp ?? new Date().toISOString();
+  const path = traceLogPath(input.cwd, timestamp);
+  const event = {
+    timestamp,
+    event: input.event,
+    cwd: input.cwd,
+    pid: input.pid ?? process.pid,
+    ...input.argv ? { argv: redactArgv(input.argv) } : {},
+    ...input.env ? { env: pickRelevantEnv(input.env) } : {},
+    ...input.data ? { data: redactData(input.data) } : {}
+  };
+  mkdirSync5(join4(input.cwd, ".agentbridge", "logs"), { recursive: true });
+  appendFileSync2(path, JSON.stringify(event) + `
+`, "utf-8");
+  return path;
+}
+function isEnvSnapshot(key, value) {
+  return /env$/i.test(key) && !!value && typeof value === "object" && !Array.isArray(value);
+}
+function redactData(value, key = "") {
+  if (typeof value === "string") {
+    return SECRET_KEY_RE.test(key) ? "<redacted>" : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactData(item, key));
+  }
+  if (value && typeof value === "object") {
+    const redacted = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      if (SECRET_KEY_RE.test(childKey)) {
+        redacted[childKey] = "<redacted>";
+      } else if (isEnvSnapshot(childKey, childValue)) {
+        redacted[childKey] = pickRelevantEnv(childValue);
+      } else {
+        redacted[childKey] = redactData(childValue, childKey);
+      }
+    }
+    return redacted;
+  }
+  return value;
+}
+
 // src/bridge.ts
+var originalEnv = { ...process.env };
+var envGuardResult = guardAgentBridgeEnv({
+  cwd: process.cwd(),
+  env: process.env,
+  mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
+  allowStrict: false,
+  log: (msg) => process.stderr.write(`${msg}
+`)
+});
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
@@ -14800,7 +15081,7 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
-var daemonClient = new DaemonClient(CONTROL_WS_URL);
+var daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity() });
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;
@@ -14815,6 +15096,27 @@ var disabledRecoveryInFlight = false;
 var disabledRecoveryAttempts = 0;
 var DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 var DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
+if (process.env.AGENTBRIDGE_TRACE === "1") {
+  try {
+    appendTraceEvent({
+      cwd: process.cwd(),
+      event: "bridge.start",
+      pid: process.pid,
+      argv: process.argv,
+      env: process.env,
+      data: {
+        originalEnv: pickRelevantEnv(originalEnv),
+        effectiveEnv: pickRelevantEnv(process.env),
+        envGuardAction: envGuardResult.action,
+        pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+        pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
+        stateDir: stateDir.dir,
+        controlPort: CONTROL_PORT,
+        build: BUILD_INFO
+      }
+    });
+  } catch {}
+}
 claude.setReplySender(async (msg, requireReply) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
@@ -14908,16 +15210,35 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    const status = await daemonClient.attachClaudeAndWaitForStatus(1500);
+    if (!status) {
+      throw new Error("Daemon did not confirm Claude attach.");
+    }
+    assertAttachedToExpectedDaemon(status);
     daemonDisabledReason = null;
     if (!isReconnect) {
-      claude.pushNotification(systemMessage("system_bridge_ready", `\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: ${pairScopedCommand("codex")}`));
+      claude.pushNotification(systemMessage(status.bridgeReady ? "system_bridge_ready" : "system_bridge_waiting", initialAttachMessage(status)));
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
     await claude.pushNotification(systemMessage("system_daemon_connect_failed", `\u274C AgentBridge daemon failed to start or is unreachable: ${err.message}`));
     throw err;
   }
+}
+function assertAttachedToExpectedDaemon(status) {
+  const expectedPairId = process.env.AGENTBRIDGE_PAIR_ID || null;
+  if (expectedPairId && status.pairId !== expectedPairId) {
+    throw new Error(`Daemon identity mismatch after attach: expected pair ${expectedPairId}, got ${status.pairId ?? "<none>"}.`);
+  }
+}
+function initialAttachMessage(status) {
+  if (status.bridgeReady) {
+    return "\u2705 AgentBridge bridge is ready. Codex TUI is connected.";
+  }
+  if (status.tuiConnected) {
+    return "\u23F3 AgentBridge attached to daemon. Waiting for Codex to finish creating a thread.";
+  }
+  return `\u23F3 AgentBridge attached to daemon. Waiting for Codex TUI. Start Codex in another terminal with: ${pairScopedCommand("codex")}`;
 }
 async function enterDisabledState(logMessage, notificationContent) {
   if (daemonDisabled)
@@ -15086,6 +15407,17 @@ function systemMessage(idPrefix, content) {
     timestamp: Date.now()
   };
 }
+function currentClientIdentity() {
+  return {
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
+    cwd: process.cwd(),
+    baseDir: process.env.AGENTBRIDGE_BASE_DIR ?? null,
+    stateDir: stateDir.dir,
+    clientPid: process.pid,
+    contractVersion: BUILD_INFO.contractVersion
+  };
+}
 function shutdown(reason) {
   if (shuttingDown)
     return;
@@ -15121,7 +15453,7 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(stateDir.logFile, line);
+    appendRotatingLog(stateDir.logFile, line);
   } catch {}
 }
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);

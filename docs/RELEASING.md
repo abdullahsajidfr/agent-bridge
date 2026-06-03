@@ -121,10 +121,51 @@ global package, so afterward `npm install -g @raysonmeng/agentbridge@latest`
 cleanly overrides whatever you installed — there is no leftover `bun link` symlink
 to conflict with.
 
+Both install modes (via `scripts/install-global.mjs`) first stop registered
+AgentBridge daemons and managed Codex TUIs directly (`install-safety.cjs
+stop-running`) using a scrubbed install environment, then replace the package.
+Local installs also rebuild `dist/` and plugin bundles, verify required
+artifacts on disk, pack a tarball, and verify the tarball before installing it.
+Use `node scripts/install-global.mjs local --dry-run` to inspect the sequence
+without stopping anything.
+
+### What stops running daemons (and what doesn't) / 谁会停掉运行中的 daemon
+
+Stopping all running AgentBridge daemons/TUIs is destructive, so it is **not**
+triggered by arbitrary installs. There are exactly two paths that stop them:
+
+1. **The intentional installer** — `scripts/install-global.mjs` (`bun run
+   install:global:*`) calls `install-safety.cjs stop-running` directly, in both
+   `local` and `npm` modes.
+2. **An explicit global self-install via npm `postinstall`** — `scripts/postinstall.cjs`
+   stops running daemons **only** when it detects an explicit global signal:
+   - `npm_config_global=true` (i.e. `npm install -g …`), or
+   - `npm_config_location=global`, or
+   - `AGENTBRIDGE_POSTINSTALL_STOP=1` (force override).
+
+   `AGENTBRIDGE_POSTINSTALL_STOP=0` forces the opposite (never stop), taking
+   precedence over the global signals.
+
+Crucially, **arbitrary `.tgz` / transitive-dependency installs do NOT stop
+running daemons** — a non-global `npm install`, or AgentBridge being pulled in as
+someone else's dependency, leaves every running pair untouched (postinstall logs
+a note pointing at `abg kill --all` / install-global). Stop-the-world is reserved
+for the two intentional paths above.
+
+停掉所有运行中的 daemon/TUI 是破坏性操作,因此**不会**被任意安装触发。只有两条路径会停:
+(1) **有意安装器** `scripts/install-global.mjs`(`bun run install:global:*`)在 `local` 与
+`npm` 两种模式下都直接调用 `install-safety.cjs stop-running`;(2) **经 npm `postinstall`
+的显式全局自安装**——`scripts/postinstall.cjs` 仅在检测到显式全局信号时才停
+(`npm_config_global=true` / `npm_config_location=global` / `AGENTBRIDGE_POSTINSTALL_STOP=1`;
+`AGENTBRIDGE_POSTINSTALL_STOP=0` 强制不停,优先级最高)。**任意 `.tgz` / 传递依赖安装
+不会停掉运行中的 daemon**——非全局 `npm install`、或被当作他人依赖拉入时,所有运行中的
+pair 都保持不动(postinstall 只打一条提示指向 `abg kill --all` / install-global)。
+
 The CLI and the Claude Code **plugin** are separate installs. `install:global:*`
 updates the CLI; the npm `postinstall` best-effort registers/installs the plugin,
-but an already-installed plugin cache and an active Claude session are NOT
-force-refreshed. To make the plugin match your source and reload it:
+but an active Claude Code session may still need a plugin reload or restart to
+pick up the newly installed plugin bundle. To make the plugin match your source
+and reload it:
 
 ```bash
 bun run install:global:local
@@ -137,3 +178,32 @@ bun src/cli.ts dev        # build + sync the plugin from THIS checkout into Clau
 > Run `bun src/cli.ts dev` (from the source checkout) rather than the globally
 > installed `agentbridge dev`, so the plugin is synced from your working tree, not
 > the global npm package dir.
+
+## Breaking changes / migration / 破坏性变更与迁移
+
+### `AGENTBRIDGE_MANUAL=1` now required for pinned-env classic single-pair mode
+
+**BREAKING (power users):** Previously, exporting a pinned `AGENTBRIDGE_STATE_DIR`
+and/or a pinned port (e.g. `AGENTBRIDGE_CONTROL_PORT`) **without** a `--pair` was
+enough to opt into classic single-pair mode — AgentBridge honored that pinned
+environment as-is.
+
+That is no longer true. With cwd-scoped pair resolution as the default, a pinned
+`AGENTBRIDGE_STATE_DIR` / port **without** `AGENTBRIDGE_MANUAL=1` is now treated as
+**stale** and **overwritten** by the cwd-derived pair (state dir + ports resolved
+from the current working directory). To keep the old behavior — i.e. force
+AgentBridge to use exactly the state dir / ports you pinned — you must now set:
+
+```bash
+export AGENTBRIDGE_MANUAL=1
+```
+
+explicitly, alongside your pinned `AGENTBRIDGE_STATE_DIR` / port env. Without it,
+your pins are ignored and cwd-scoped resolution wins.
+
+**迁移说明(破坏性,面向高级用户):** 以前只要导出固定的 `AGENTBRIDGE_STATE_DIR` 和/或
+固定端口(且**不带** `--pair`)就能进入经典单 pair 模式,AgentBridge 会原样沿用这些固定环境。
+现在不再如此:由于默认走 cwd 作用域的 pair 解析,**不带** `AGENTBRIDGE_MANUAL=1` 的固定
+`AGENTBRIDGE_STATE_DIR` / 端口会被视为**过期**并被 cwd 派生的 pair(按当前工作目录解析的
+state dir + 端口)**覆盖**。若想保留旧行为(强制使用你固定的 state dir / 端口),必须显式设置
+`export AGENTBRIDGE_MANUAL=1`,与固定环境变量一起使用;否则你的固定值会被忽略,cwd 作用域解析优先。

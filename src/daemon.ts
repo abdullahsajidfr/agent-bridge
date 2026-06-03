@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
-import { appendFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
+import { daemonStatusBuildInfo } from "./build-info";
 import { CodexAdapter } from "./codex-adapter";
+import { validateClaudeClientIdentity } from "./daemon-identity";
 import {
   REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
@@ -19,7 +20,15 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import { ReplyRequiredTracker } from "./reply-required-tracker";
+import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
+import { appendRotatingLog } from "./rotating-log";
+import type {
+  ControlClientIdentity,
+  ControlClientMessage,
+  ControlServerMessage,
+  DaemonStatus,
+} from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 
@@ -30,6 +39,7 @@ interface ControlSocketData {
   lastPongAt: number;
   /** Monotonic pong counter — the liveness probe's source of truth (see liveness-probe.ts). */
   pongCount: number;
+  identity?: ControlClientIdentity;
 }
 
 const stateDir = new StateDirResolver();
@@ -57,6 +67,7 @@ const BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_
 // codex's port not yet released). After these, the daemon self-exits — further
 // replacement is owned by the lifecycle (ensureRunning), not by retrying forever here.
 const CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
+const ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -70,8 +81,7 @@ let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
-let replyRequired = false;
-let replyReceivedDuringTurn = false;
+const replyTracker = new ReplyRequiredTracker();
 let shuttingDown = false;
 let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -134,10 +144,10 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
-  // When replyRequired is active, force-forward ALL messages regardless of marker
-  if (replyRequired) {
+  // When require_reply is armed, force-forward ALL messages regardless of marker
+  if (replyTracker.isArmed) {
     log(`Codex → Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
-    replyReceivedDuringTurn = true;
+    replyTracker.noteForwarded();
     if (statusBuffer.size > 0) {
       statusBuffer.flush("reply-required message arrived");
     }
@@ -176,8 +186,10 @@ codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
 
-  // Check if reply was required but Codex didn't send any agentMessage
-  if (replyRequired && !replyReceivedDuringTurn) {
+  // Check if reply was required but Codex didn't send any agentMessage, then
+  // clear the reply-required state.
+  const { warnReplyMissing } = replyTracker.consumeOnTurnComplete();
+  if (warnReplyMissing) {
     log("⚠️ Reply was required but Codex did not send any agentMessage");
     emitToClaude(
       systemMessage(
@@ -186,10 +198,6 @@ codex.on("turnCompleted", () => {
       ),
     );
   }
-
-  // Reset reply-required state
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
 
   emitToClaude(
     systemMessage(
@@ -200,6 +208,24 @@ codex.on("turnCompleted", () => {
   startAttentionWindow();
 });
 
+codex.on("turnAborted", (reason: string) => {
+  // A turn ended without a normal turn/completed (app-server close / reconnect /
+  // stop). Clear the require_reply tracker so its armed state cannot be inherited
+  // by a later, unrelated turn (force-forward leak + misattributed warning).
+  log(`Codex turn aborted (${reason}) — clearing reply-required state`);
+  replyTracker.reset();
+});
+
+codex.on("turnStalled", (event: { turnId: string; inactivityMs: number }) => {
+  log(`Codex turn stalled (${event.turnId}, inactivity ${event.inactivityMs}ms)`);
+  emitToClaude(
+    systemMessage(
+      "system_turn_stalled",
+      `⚠️ Codex has been silent for ${event.inactivityMs}ms while a turn is still in progress. AgentBridge is keeping the turn busy and will not send a fake completion; wait for Codex to finish or reconnect the TUI if it is stuck.`,
+    ),
+  );
+});
+
 codex.on("ready", (threadId: string) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready — thread ${threadId}`);
@@ -208,6 +234,29 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
   );
+});
+
+codex.on("threadChanged", (event: { threadId: string; previousThreadId: string | null; reason: string }) => {
+  broadcastStatus();
+  void persistCurrentThreadWithRolloutRetry(
+    {
+      stateDir,
+      pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+      pairName: process.env.AGENTBRIDGE_PAIR_NAME,
+      cwd: process.cwd(),
+    },
+    event.threadId,
+    event.reason,
+    {
+      log,
+      // Abandon this loop the moment a newer thread switch supersedes it, so a
+      // lingering retry cannot clobber current-thread.json with an abandoned
+      // threadId (which would auto-resume the wrong thread or break resume).
+      shouldContinue: () => codex.activeThreadId === event.threadId,
+    },
+  ).catch((err) => {
+    log(`Failed to persist current thread ${event.threadId}: ${err?.message ?? err}`);
+  });
 });
 
 codex.on("tuiConnected", (connId: number) => {
@@ -231,6 +280,7 @@ codex.on("error", (err: Error) => {
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
+  replyTracker.reset(); // any in-flight require_reply turn is gone with the process
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -305,7 +355,18 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws).catch((err) => {
+      const admission = validateClaudeClientIdentity({
+        expectedPairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+        daemonCwd: process.cwd(),
+        identity: message.identity,
+        allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
+      });
+      if (!admission.ok) {
+        log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);
+        ws.close(admission.closeCode, admission.reason);
+        return;
+      }
+      attachClaude(ws, message.identity).catch((err) => {
         log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
@@ -349,9 +410,6 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       let contentToSend = message.message.content;
       if (requireReply) {
         contentToSend += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
       }
       log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentToSend);
@@ -368,6 +426,14 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         });
         return;
       }
+      // Arm reply-required tracking ONLY after a successful injection: a turn has
+      // now started, so turnCompleted will reset it. Arming before this guard
+      // (on a rejected injection, e.g. Codex busy) would strand the flag on an
+      // unrelated in-flight turn and silently lose this require_reply request.
+      if (requireReply) {
+        replyTracker.arm();
+        log(`Reply required flag set for this message`);
+      }
       clearAttentionWindow(); // Claude successfully replied, end attention window
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
@@ -379,7 +445,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
   }
 }
 
-async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
+async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: ControlClientIdentity) {
   const occupant = attachedClaude;
   if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
     // Slot is occupied by another socket that hasn't yet shown us FIN.
@@ -442,10 +508,13 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   }
 
   clearPendingClaudeDisconnect("Claude frontend attached");
+  ws.data.identity = identity;
   attachedClaude = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
+  log(
+    `Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`,
+  );
 
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
@@ -716,6 +785,9 @@ function currentStatus(): DaemonStatus {
     // control port (wrong pairId) and replace it instead of reusing it. null in
     // legacy/manual single-pair mode (no pairId enforcement there).
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo(),
   };
 }
 
@@ -752,6 +824,9 @@ function writeStatusFile() {
     pid: process.pid,
     // Pair identity for diagnostics (null in legacy/manual single-pair mode).
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo(),
   });
 }
 
@@ -865,7 +940,7 @@ function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
   process.stderr.write(line);
   try {
-    appendFileSync(stateDir.logFile, line);
+    appendRotatingLog(stateDir.logFile, line);
   } catch {}
 }
 

@@ -2,13 +2,25 @@ import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { DaemonClient } from "../daemon-client";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { BUILD_INFO } from "../build-info";
+import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "../env-guard";
 import { parsePositiveIntEnv } from "../env-utils";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
+import { appendTraceEvent, pickRelevantEnv } from "../trace-log";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
 
 export async function runClaude(args: string[]) {
+  const originalEnv = { ...process.env };
+  const envGuardResult = guardAgentBridgeEnv({
+    cwd: process.cwd(),
+    env: process.env,
+    mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
+    allowStrict: true,
+    log: (msg) => console.error(msg),
+  });
+
   // Strip `--pair <name>` before anything else; the rest flows through to claude.
   const { pairFlag, rest } = parsePairFlag(args);
 
@@ -27,6 +39,9 @@ export async function runClaude(args: string[]) {
   }
 
   if (pair.warning) console.error(`[agentbridge] ⚠️  ${pair.warning}`);
+  if (process.env.AGENTBRIDGE_TRACE === "1") {
+    traceCliStart("cli.claude.start", args, originalEnv, envGuardResult.action, pair);
+  }
 
   const stateDir = pair.stateDir;
   const controlPort = pair.ports.controlPort;
@@ -45,11 +60,10 @@ export async function runClaude(args: string[]) {
 
   // Conflict guard: refuse to launch a SECOND Claude frontend into a pair that
   // already has a LIVE one (the confirmed "smart" behaviour: live → error here,
-  // stale/none → fall through and let admission take over). Skipped in manual
-  // mode (power-user single-pair). Fail-open on any probe error.
-  if (!pair.manual) {
-    await assertPairNotLive(lifecycle, pair);
-  }
+  // stale/none → fall through and let admission take over). Also applies in
+  // explicit manual mode so manual sessions do not silently fight over attach.
+  // Fail-open on any probe error.
+  await assertPairNotLive(lifecycle, pair);
 
   lifecycle.clearKilled();
 
@@ -85,6 +99,38 @@ export async function runClaude(args: string[]) {
     console.error(`Error starting Claude Code: ${err.message}`);
     process.exit(1);
   });
+}
+
+function traceCliStart(
+  event: string,
+  args: string[],
+  originalEnv: NodeJS.ProcessEnv,
+  envGuardAction: string,
+  pair: PairResolution,
+) {
+  try {
+    appendTraceEvent({
+      cwd: process.cwd(),
+      event,
+      pid: process.pid,
+      argv: ["agentbridge", "claude", ...args],
+      env: process.env,
+      data: {
+        originalEnv: pickRelevantEnv(originalEnv),
+        effectiveEnv: pickRelevantEnv(process.env),
+        envGuardAction,
+        pairId: pair.pairId,
+        pairName: pair.name,
+        manual: pair.manual,
+        slot: pair.slot,
+        stateDir: pair.stateDir.dir,
+        ports: pair.ports,
+        build: BUILD_INFO,
+      },
+    });
+  } catch {
+    // Trace logging is diagnostic only.
+  }
 }
 
 /**

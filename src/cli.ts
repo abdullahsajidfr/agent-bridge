@@ -20,7 +20,7 @@ const REFRESH_COMMANDS = new Set(["claude", "codex"]);
 const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev"]);
 
 /** Subcommands that accept a `--pair <name>` selector. */
-const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill"]);
+const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor"]);
 
 /**
  * Split argv into the subcommand and its args, allowing a leading `--pair <name>`
@@ -100,6 +100,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runPairs } = await import("./cli/pairs");
       await runPairs(restArgs);
       break;
+    case "doctor":
+      const { runDoctor } = await import("./cli/doctor");
+      await runDoctor(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -130,6 +134,8 @@ Commands:
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon
   pairs [rm <name|id>]  List running Claude+Codex pairs (or remove one)
+  doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
+  doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
   kill [--pair <name|id>]  Stop all pairs, or just one with --pair (alias: --all)
 
 Options:
@@ -154,8 +160,10 @@ Examples:
   abg --pair work codex        # Connect Codex to the "work" pair
   abg --pair review claude     # A second, parallel pair
   abg pairs                    # List all pairs and their ports/status
+  abg pairs --threads          # Include current thread mapping
+  abg doctor --json            # Emit a structured diagnostics report
   abg pairs rm work            # Stop this directory's "work" pair and free its slot
-  abg pairs rm work-1a2b3c4d   # ...or by its full id (works from any directory)
+  abg pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
   abg --pair work kill         # Stop only this directory's "work" pair
   abg kill                     # Stop ALL pairs
 `.trim());

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StateDirResolver } from "../state-dir";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { BUILD_INFO } from "../build-info";
 
 // Allocate an ephemeral free port so these tests never collide with a real
 // dev-machine daemon (4500-45xx) or each other.
@@ -82,6 +83,7 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
           appServerUrl: "",
           pid: state.pid ?? 99999,
           pairId: state.pairId,
+          build: BUILD_INFO,
         };
         if (u.pathname === "/healthz") return Response.json(body);
         if (u.pathname === "/readyz") return Response.json(body, { status: state.readyzStatus });
@@ -135,6 +137,92 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     expect(killed).toBe(true);
     expect(launched).toBe(true);
     expect(killPid).toBe(99999); // targeted kill via the /healthz body pid, not the pid file
+  });
+
+  test("replaces a drifted daemon even when pair identity matches", async () => {
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    const s = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        const body = {
+          bridgeReady: true,
+          tuiConnected: true,
+          threadId: "thread",
+          queuedMessageCount: 0,
+          proxyUrl: "",
+          appServerUrl: "",
+          pid: 99999,
+          pairId: "mine-aaaa0000",
+          build: { ...BUILD_INFO, commit: "old-build" },
+        };
+        if (u.pathname === "/healthz" || u.pathname === "/readyz") return Response.json(body);
+        return new Response("ok");
+      },
+    });
+    servers.push(s);
+    const lc = lifecycle(port);
+    let killed = false;
+    let launched = false;
+    let killPid: number | undefined;
+    (lc as any).kill = async (_t?: number, pid?: number) => {
+      killed = true;
+      killPid = pid;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+    await lc.ensureRunning();
+    expect(killed).toBe(true);
+    expect(launched).toBe(true);
+    expect(killPid).toBe(99999);
+  });
+
+  test("does NOT replace a daemon that differs only by bundle kind (dist vs plugin)", async () => {
+    // The dist CLI (`agentbridge codex`) and the Claude Code plugin bridge launch
+    // co-equal daemons from the same source for the same pair + control port. Their
+    // BUILD_INFO.bundle differs ("dist" vs "plugin") but version/commit/contract match.
+    // This MUST be reused, not replaced — otherwise the two launchers replace-war.
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    const s = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        const body = {
+          bridgeReady: true,
+          tuiConnected: true,
+          threadId: "thread",
+          queuedMessageCount: 0,
+          proxyUrl: "",
+          appServerUrl: "",
+          pid: 99999,
+          pairId: "mine-aaaa0000",
+          // Same version/commit/contractVersion as the launcher; only `bundle` differs.
+          build: { ...BUILD_INFO, bundle: BUILD_INFO.bundle === "plugin" ? "dist" : "plugin" },
+        };
+        if (u.pathname === "/healthz" || u.pathname === "/readyz") return Response.json(body);
+        return new Response("ok");
+      },
+    });
+    servers.push(s);
+    const lc = lifecycle(port);
+    let killed = false;
+    let launched = false;
+    (lc as any).kill = async () => {
+      killed = true;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+    await lc.ensureRunning();
+    expect(killed).toBe(false);
+    expect(launched).toBe(false);
   });
 
   test("replaces a healthz-OK but readyz-503 zombie", async () => {

@@ -48,7 +48,7 @@ export async function runKill(args: string[] = []) {
   if (parsed.pairFlag !== undefined) {
     // The friendly name is scoped to the current directory (same name elsewhere
     // is a different pair); findPairForFlag composes it with the cwd, falling
-    // back to a raw pairId match for ids copied from `abg pairs`.
+    // back to a raw pairId match for an id copied from `abg pairs` — same cwd only.
     let pair: PairEntry | null;
     try {
       pair = findPairForFlag(base, process.cwd(), parsed.pairFlag);
@@ -112,8 +112,8 @@ Usage: abg kill [--all]
 Stops AgentBridge daemon/TUI processes.
 
 Options:
-  --pair <name|id>  Stop only one pair — a cwd-scoped name (e.g. "main") or a
-                    full pair id from "abg pairs".
+  --pair <name|id>  Stop only one pair — a cwd-scoped name (e.g. "main") or the
+                    same pair id when run from that directory.
   --all             Stop all registered pairs and any legacy-root daemon.
   --help, -h        Show this help message.
 

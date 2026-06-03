@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "./build-info";
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
 import type { DaemonStatus } from "./control-protocol";
@@ -18,6 +19,7 @@ const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 // healthz-OK/readyz-503 zombie so we replace it instead of hanging the full ~10s.
 const REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 const REUSE_READY_DELAY_MS = 250;
+const HEALTH_FETCH_TIMEOUT_MS = 500;
 
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;
@@ -60,7 +62,7 @@ export class DaemonLifecycle {
   /** Fetch the daemon's /healthz status body (null if unreachable / non-OK / unparseable). */
   private async fetchStatus(): Promise<DaemonStatus | null> {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       if (!response.ok) return null;
       return (await response.json()) as DaemonStatus;
     } catch {
@@ -85,6 +87,17 @@ export class DaemonLifecycle {
     return reported !== expected;
   }
 
+  private isBuildDrifted(status: DaemonStatus | null): boolean {
+    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1") return false;
+    const runtime = status?.build;
+    if (!runtime) return true;
+    // Compare the runtime CONTRACT (version/commit/contractVersion), NOT `bundle`:
+    // the dist CLI and the Claude Code plugin launch co-equal daemons from the same
+    // source for the same pair, so a bundle-kind difference must not trigger a
+    // destructive replace (that would replace-war the two launchers).
+    return !sameRuntimeContract(runtime, BUILD_INFO);
+  }
+
   /** Ensure daemon is running: reuse a healthy one, replace a bad/foreign one, else launch. */
   async ensureRunning(): Promise<void> {
     // Fast path: something answers /healthz on our control port. But healthz 200 only
@@ -96,6 +109,14 @@ export class DaemonLifecycle {
         this.log(
           `Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` +
             `but this pair is ${this.expectedPairId} — replacing foreign daemon`,
+        );
+        await this.replaceUnhealthyDaemon(status?.pid);
+        return;
+      }
+      if (this.isBuildDrifted(status)) {
+        this.log(
+          `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
+            `but launcher is ${formatBuildInfo(BUILD_INFO)} — replacing drifted daemon`,
         );
         await this.replaceUnhealthyDaemon(status?.pid);
         return;
@@ -152,12 +173,24 @@ export class DaemonLifecycle {
         return;
       }
       // Re-check under the lock: a concurrent launcher may have just started one.
-      if ((await this.isHealthy()) && !this.isForeignDaemon(await this.fetchStatus())) {
-        try {
-          await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
-          return;
-        } catch {
-          // not ready → fall through to (re)launch under this lock
+      if (await this.isHealthy()) {
+        const status = await this.fetchStatus();
+        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+          this.log(
+            `Daemon on control port ${this.controlPort} is not reusable under startup lock ` +
+              `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) — replacing`,
+          );
+          await this.kill(3000, status?.pid);
+        } else {
+          try {
+            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            return;
+          } catch {
+            this.log(
+              `Daemon on control port ${this.controlPort} is healthy but not ready under startup lock — replacing`,
+            );
+            await this.kill(3000, status?.pid);
+          }
         }
       }
       this.launch();
@@ -168,7 +201,7 @@ export class DaemonLifecycle {
   /** Check if daemon health endpoint responds. */
   async isHealthy(): Promise<boolean> {
     try {
-      const response = await fetch(this.healthUrl);
+      const response = await fetchWithTimeout(this.healthUrl);
       return response.ok;
     } catch {
       return false;
@@ -187,7 +220,7 @@ export class DaemonLifecycle {
   /** Check if daemon is ready to accept Codex TUI connections. */
   async isReady(): Promise<boolean> {
     try {
-      const response = await fetch(this.readyUrl);
+      const response = await fetchWithTimeout(this.readyUrl);
       return response.ok;
     } catch {
       return false;
@@ -214,7 +247,7 @@ export class DaemonLifecycle {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status)) return; // ready + ours (or manual mode)
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) return; // ready + ours + current build
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -335,7 +368,7 @@ export class DaemonLifecycle {
       // Re-check under the lock: the daemon may have readied or been replaced already.
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status)) {
+        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return; // someone else already fixed it — don't kill
@@ -508,6 +541,16 @@ export class DaemonLifecycle {
   private cleanup(): void {
     this.removePidFile();
     this.removeStatusFile();
+  }
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = HEALTH_FETCH_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
 

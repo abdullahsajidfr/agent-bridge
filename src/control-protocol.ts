@@ -1,4 +1,15 @@
 import type { BridgeMessage } from "./types";
+import type { AgentBridgeBuildInfo } from "./build-info";
+
+export interface ControlClientIdentity {
+  pairId?: string | null;
+  pairName?: string | null;
+  cwd?: string;
+  baseDir?: string | null;
+  stateDir?: string | null;
+  clientPid?: number;
+  contractVersion?: number;
+}
 
 export interface DaemonStatus {
   bridgeReady: boolean;
@@ -10,10 +21,13 @@ export interface DaemonStatus {
   pid: number;
   /** Multi-pair identity for diagnostics; null in legacy/manual single-pair mode. */
   pairId?: string | null;
+  cwd?: string | null;
+  stateDir?: string | null;
+  build?: AgentBridgeBuildInfo;
 }
 
 export type ControlClientMessage =
-  | { type: "claude_connect" }
+  | { type: "claude_connect"; identity?: ControlClientIdentity }
   | { type: "claude_disconnect" }
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
   | { type: "status" }
@@ -50,3 +64,6 @@ export const CLOSE_CODE_EVICTED_STALE = 4002;
  * (the in-flight probe will conclude within LIVENESS_PROBE_TIMEOUT_MS).
  */
 export const CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+
+/** WebSocket close code reserved for pair/cwd identity mismatch enforcement. */
+export const CLOSE_CODE_PAIR_MISMATCH = 4004;

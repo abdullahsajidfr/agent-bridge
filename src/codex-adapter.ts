@@ -12,8 +12,8 @@
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { appendRotatingLog } from "./rotating-log";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
@@ -108,6 +108,8 @@ export class CodexAdapter extends EventEmitter {
     tuiWs: ServerWebSocket<TuiSocketData>;
     appServerWs: WebSocket | null;
     buffer: string[];
+    initialized: boolean;
+    initializationReplayed: boolean;
   }>();
 
   private agentMessageBuffers = new Map<string, string[]>();
@@ -117,9 +119,17 @@ export class CodexAdapter extends EventEmitter {
   // #69: per-turn inactivity watchdog. A lost `turn/completed` would otherwise
   // leave turnInProgress=true forever and permanently block injection. Each
   // active turn gets a timer (keyed identically to activeTurnIds) that is
-  // refreshed on any app-server notification and, on expiry, force-completes the
-  // turn so Claude is never locked out.
+  // refreshed on any app-server notification and, on expiry, marks the turn as
+  // stalled. It must NOT complete the turn: a long silent command is still a
+  // live busy turn until Codex emits turn/completed or the connection is reset.
   private turnWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+  // turnStalled must fire AT MOST ONCE per turn: the watchdog is intentionally
+  // NOT cleared on stall (the turn stays busy), so every subsequent app-server
+  // notification re-arms it and a later expiry would emit a duplicate stalled
+  // notification. This set records turnIds already reported stalled so we
+  // suppress repeats; a turnId is removed when its turn completes/resets or a
+  // new turn starts, so a genuinely new stall in a later turn still notifies.
+  private stalledTurnIds = new Set<string>();
   // #70: latest-issued thread-switch sequence (see PendingRequest.threadSwitchSeq).
   private threadSwitchSeq = 0;
 
@@ -823,7 +833,13 @@ export class CodexAdapter extends EventEmitter {
     // Store the appWs handle immediately (not just in onopen) so that
     // onTuiDisconnect can close it even if the picker disconnects before
     // the app-server WS finishes connecting.
-    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] as string[] };
+    const entry = {
+      tuiWs: ws,
+      appServerWs: appWs,
+      buffer: [] as string[],
+      initialized: false,
+      initializationReplayed: false,
+    };
     this.secondaryConnections.set(connId, entry);
 
     appWs.onopen = () => {
@@ -977,11 +993,13 @@ export class CodexAdapter extends EventEmitter {
     // Route secondary (picker) connection messages to their own app-server WS
     const secondary = this.secondaryConnections.get(connId);
     if (secondary) {
-      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
-        try { secondary.appServerWs.send(data); } catch {}
-      } else {
-        secondary.buffer.push(data);
+      const method = this.detectJsonMethod(data);
+      if (method === "initialize" || method === "initialized") {
+        secondary.initialized = true;
+      } else if (!secondary.initialized) {
+        this.ensureSecondaryInitialized(secondary, connId);
       }
+      this.sendOrBufferSecondary(secondary, data);
       return;
     }
 
@@ -1120,6 +1138,54 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
+  private detectJsonMethod(raw: string): string | undefined {
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed?.method === "string" ? parsed.method : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private ensureSecondaryInitialized(
+    secondary: {
+      appServerWs: WebSocket | null;
+      buffer: string[];
+      initialized: boolean;
+      initializationReplayed: boolean;
+    },
+    connId: number,
+  ) {
+    if (secondary.initializationReplayed) return;
+    secondary.initializationReplayed = true;
+
+    if (!this.lastInitializeRaw) {
+      this.log(`Secondary conn #${connId}: no cached initialize available before first non-initialize request`);
+      return;
+    }
+
+    this.log(`Secondary conn #${connId}: replaying cached initialize before picker request`);
+    this.sendOrBufferSecondary(secondary, this.lastInitializeRaw);
+    if (this.lastInitializedRaw) {
+      this.sendOrBufferSecondary(secondary, this.lastInitializedRaw);
+    }
+    secondary.initialized = true;
+  }
+
+  private sendOrBufferSecondary(
+    secondary: {
+      appServerWs: WebSocket | null;
+      buffer: string[];
+    },
+    raw: string,
+  ) {
+    if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+      try { secondary.appServerWs.send(raw); } catch {}
+    } else {
+      secondary.buffer.push(raw);
+    }
+  }
+
   // ── Response Patching ──────────────────────────────────────
 
   private handleAppServerPayload(raw: string): string | null {
@@ -1133,7 +1199,7 @@ export class CodexAdapter extends EventEmitter {
       // actively-streaming turn (e.g. a multi-minute build) emits only these
       // "unknown" notifications between turn/started and turn/completed; if we
       // refreshed only on the handful in isAppServerNotification() we would
-      // force-complete a live turn. Responses and server requests count as
+      // mark a live turn stalled. Responses and server requests count as
       // activity too. (refreshTurnWatchdogs() no-ops when no turn is active.)
       if (typeof parsed === "object" && parsed !== null) {
         this.refreshTurnWatchdogs();
@@ -1287,6 +1353,12 @@ export class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        // A bridge-originated request is always an injected turn/start. If Codex
+        // REJECTS it (error response) before any turn/started, no turn ever goes
+        // in-progress, so resetTurnState's wasInProgress-gated turnAborted never
+        // fires. Signal the abort here so daemon-level per-turn state (the
+        // require_reply tracker) is not stranded on a turn that never started.
+        this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1527,6 +1599,7 @@ export class CodexAdapter extends EventEmitter {
 
     const previousThreadId = this.threadId;
     this.threadId = threadId;
+    this.emit("threadChanged", { threadId, previousThreadId, reason });
 
     if (previousThreadId) {
       this.log(`Active thread changed: ${previousThreadId} → ${threadId} (${reason})`);
@@ -1543,6 +1616,10 @@ export class CodexAdapter extends EventEmitter {
     // two never diverge (incl. the no-turn-id `unknown:` fallback).
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
     this.activeTurnIds.add(turnKey);
+    // A new turn must be eligible to notify on stall even if a prior turn
+    // reused the same id (e.g. the `unknown:` fallback is time-stamped, but
+    // real ids could repeat across reconnects).
+    this.stalledTurnIds.delete(turnKey);
     this.scheduleTurnWatchdog(turnKey);
 
     this.turnInProgress = this.activeTurnIds.size > 0;
@@ -1555,9 +1632,11 @@ export class CodexAdapter extends EventEmitter {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
       this.clearTurnWatchdog(turnId);
+      this.stalledTurnIds.delete(turnId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
+      this.stalledTurnIds.clear();
     }
 
     this.turnInProgress = this.activeTurnIds.size > 0;
@@ -1576,9 +1655,9 @@ export class CodexAdapter extends EventEmitter {
       if (!this.activeTurnIds.has(turnKey)) return;
       this.log(
         `WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity — ` +
-        `assuming a lost turn/completed; force-completing to unblock injection`,
+        `marking stalled but keeping Codex busy until a real completion or reconnect`,
       );
-      this.forceCompleteTurn(turnKey);
+      this.markTurnStalled(turnKey);
     }, this.turnWatchdogMs());
     // Never keep the process/test runner alive on account of a watchdog.
     timer.unref?.();
@@ -1601,7 +1680,7 @@ export class CodexAdapter extends EventEmitter {
   /**
    * Refresh every active turn's watchdog — called on any app-server notification
    * so the watchdog measures INACTIVITY, not total turn duration (a genuinely
-   * long but active turn keeps streaming events and is never force-completed).
+   * long but active turn keeps streaming events and is never marked stalled).
    */
   private refreshTurnWatchdogs() {
     if (this.turnWatchdogs.size === 0) return;
@@ -1610,15 +1689,18 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  /** Force-complete a single turn (watchdog expiry path). */
-  private forceCompleteTurn(turnKey: string) {
-    const wasInProgress = this.turnInProgress;
-    this.activeTurnIds.delete(turnKey);
-    this.clearTurnWatchdog(turnKey);
-    this.turnInProgress = this.activeTurnIds.size > 0;
-    if (wasInProgress && !this.turnInProgress) {
-      this.emit("turnCompleted");
-    }
+  /** Mark a turn stalled without clearing busy state (watchdog expiry path). */
+  private markTurnStalled(turnKey: string) {
+    if (!this.activeTurnIds.has(turnKey)) return;
+    this.turnInProgress = true;
+    // Emit at most once per turn: a stalled turn keeps its watchdog armed, so
+    // later notifications can re-fire it. Suppress repeats for the same turnId.
+    if (this.stalledTurnIds.has(turnKey)) return;
+    this.stalledTurnIds.add(turnKey);
+    this.emit("turnStalled", {
+      turnId: turnKey,
+      inactivityMs: this.turnWatchdogMs(),
+    });
   }
 
   /**
@@ -1630,11 +1712,18 @@ export class CodexAdapter extends EventEmitter {
     const wasInProgress = this.turnInProgress;
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();
+    this.stalledTurnIds.clear();
     this.turnInProgress = false;
-    if (emitCompleted && wasInProgress) {
-      this.emit("turnCompleted");
-    }
     if (wasInProgress) {
+      if (emitCompleted) {
+        this.emit("turnCompleted");
+      } else {
+        // The turn ended WITHOUT a normal completion (app-server close / reconnect
+        // / stop). Signal an abort so daemon-level per-turn state (e.g. the
+        // require_reply tracker) can be cleared instead of stranded onto a later
+        // turn — turnCompleted is the ONLY other reset signal the daemon gets.
+        this.emit("turnAborted", reason);
+      }
       this.log(`Turn state reset (${reason})`);
     }
   }
@@ -1852,6 +1941,6 @@ export class CodexAdapter extends EventEmitter {
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(this.logFile, line); } catch {}
+    try { appendRotatingLog(this.logFile, line); } catch {}
   }
 }

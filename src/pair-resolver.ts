@@ -114,10 +114,10 @@ export function parseKillArgs(args: string[]): { all: boolean; pairFlag?: string
  * Resolve the pair for this invocation and inject its env so downstream code and
  * spawned children pick up the right state dir + ports.
  *
- * Manual/legacy mode: if the caller explicitly pinned the state dir or any port
- * via env AND gave no `--pair`, behave exactly like the classic single pair
- * (no registry, no slot) — this preserves power-user overrides and the existing
- * e2e harness. An explicit `--pair` always forces multi-pair resolution.
+ * Manual/legacy mode: only when the caller explicitly opts in with
+ * `AGENTBRIDGE_MANUAL=1`, pinned state-dir/port env, and no `--pair`, behave
+ * like the classic single pair (no registry, no slot). Stale runtime env without
+ * the opt-in is ignored and overwritten by cwd-scoped pair resolution.
  */
 export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairResolution> {
   // Truthiness (not `!= null`) so an empty-string env counts as unset.
@@ -127,7 +127,7 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
     !!process.env.CODEX_WS_PORT ||
     !!process.env.CODEX_PROXY_PORT;
 
-  if (opts.pairFlag === undefined && explicitEnv) {
+  if (opts.pairFlag === undefined && explicitEnv && process.env.AGENTBRIDGE_MANUAL === "1") {
     const stateDir = new StateDirResolver();
     const controlPort = Number.parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
     const appPort = Number.parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
@@ -182,19 +182,25 @@ export function findPair(base: string, pairId: string): PairEntry | null {
  * Resolve `--pair <flag>` to a registry entry the way a launch would.
  *
  * The friendly name is scoped to `cwd` (same name in another directory is a
- * different pair), so kill/pairs must compose it with the cwd hash first. Falls
- * back to a raw pairId match so an explicit composite id copied from `abg pairs`
- * (which is cwd-independent) also resolves regardless of where it is run.
+ * different pair), so kill/pairs must compose it with the cwd hash first. A raw
+ * pairId only resolves when it belongs to THIS cwd; cross-cwd raw matches are
+ * rejected so `kill` / `pairs rm` never cross directory boundaries.
  *
  * Throws PAIR_ID_INVALID (via validatePairId) for a malformed flag.
  */
 export function findPairForFlag(base: string, cwd: string, flag: string): PairEntry | null {
   const name = validatePairId(flag);
   const scopedId = derivePairId(cwd, name);
+  const scoped = findPair(base, scopedId);
+  if (scoped) return scoped;
+
   // Raw fallback uses the validated/trimmed `name` (NOT the raw `flag`) so kill/pairs
   // and launch (resolvePair, which validates first) agree on whitespace — a quoted
-  // `--pair "  <id>  "` resolves to the same pair in both paths.
-  return findPair(base, scopedId) ?? findPair(base, name);
+  // `--pair "  <id>  "` resolves to the same pair in both paths. Only reuse it when
+  // the registry entry belongs to THIS cwd; cross-cwd raw matches are treated as
+  // not found so pair operations stay directory-scoped.
+  const raw = findPair(base, name);
+  return raw && raw.cwd === cwd ? raw : null;
 }
 
 /** Ports for a pair entry (convenience for kill/pairs). */

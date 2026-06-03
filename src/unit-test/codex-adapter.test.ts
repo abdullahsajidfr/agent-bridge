@@ -110,10 +110,16 @@ describe("CodexAdapter app-server response handling", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("swallows bridge-originated error responses instead of forwarding them to the TUI", () => {
+  test("swallows bridge-originated error responses instead of forwarding them to the TUI, and emits turnAborted", () => {
+    // A-1 regression: an injected turn/start rejected by Codex BEFORE any
+    // turn/started fires no wasInProgress-gated reset, which would strand the
+    // daemon's require_reply tracker. The adapter must emit turnAborted here so
+    // the daemon clears it.
     const adapter = createAdapter();
     const intercepted: Array<{ message: any; connId?: number }> = [];
     adapter.interceptServerMessage = (message: any, connId?: number) => intercepted.push({ message, connId });
+    const aborts: string[] = [];
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
 
     adapter.trackBridgeRequestId(-2);
 
@@ -125,7 +131,21 @@ describe("CodexAdapter app-server response handling", () => {
     expect(forwarded).toBeNull();
     expect(adapter.bridgeRequestIds.has(-2)).toBe(false);
     expect(intercepted).toEqual([]);
+    expect(aborts).toHaveLength(1);
+    expect(aborts[0]).toContain("turn/start rejected");
 
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a successful bridge-originated response does not emit turnAborted", () => {
+    const adapter = createAdapter();
+    const aborts: string[] = [];
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
+
+    adapter.trackBridgeRequestId(-3);
+    adapter.handleAppServerPayload(JSON.stringify({ id: -3, result: {} }));
+
+    expect(aborts).toEqual([]);
     adapter.clearResponseTrackingState();
   });
 
@@ -245,6 +265,48 @@ describe("CodexAdapter turn state machine", () => {
     adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
     expect(events).toEqual(["completed"]);
     expect(adapter.turnInProgress).toBe(false);
+  });
+
+  test("resetTurnState emits turnAborted (not turnCompleted) when a turn is interrupted", () => {
+    // RB-1 regression: an app-server close / reconnect / stop resets turn state
+    // with emitCompleted=false. The daemon's require_reply tracker only resets on
+    // turnCompleted, so the adapter must emit turnAborted on these paths to keep
+    // the tracker from being stranded onto a later, unrelated turn.
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("turnCompleted", () => events.push("completed"));
+    adapter.on("turnAborted", (reason: string) => events.push(`aborted:${reason}`));
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.turnInProgress).toBe(true);
+
+    adapter.resetTurnState("app-server connection closed", false);
+
+    expect(adapter.turnInProgress).toBe(false);
+    expect(events).toEqual(["aborted:app-server connection closed"]);
+  });
+
+  test("resetTurnState with emitCompleted=true emits turnCompleted, not turnAborted", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("turnCompleted", () => events.push("completed"));
+    adapter.on("turnAborted", () => events.push("aborted"));
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.resetTurnState("explicit completion", true);
+
+    expect(events).toEqual(["completed"]);
+  });
+
+  test("resetTurnState emits nothing when no turn was in progress", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("turnCompleted", () => events.push("completed"));
+    adapter.on("turnAborted", () => events.push("aborted"));
+
+    adapter.resetTurnState("idle reset", false);
+
+    expect(events).toEqual([]);
   });
 
   test("injectMessage rejects during active turn", () => {
@@ -445,19 +507,23 @@ describe("CodexAdapter turn state machine", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("turn watchdog releases busy state and emits turnCompleted after inactivity", async () => {
+  test("turn watchdog marks stalled but does not fake turnCompleted after inactivity", async () => {
     await withTurnWatchdogMs(40, async () => {
       const adapter = createAdapter();
       const events: string[] = [];
+      const stalled: Array<{ turnId: string; inactivityMs: number }> = [];
       adapter.on("turnCompleted", () => events.push("completed"));
+      adapter.on("turnStalled", (event: { turnId: string; inactivityMs: number }) => stalled.push(event));
 
       adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "watchdog-turn" } } });
       expect(adapter.turnInProgress).toBe(true);
 
       await sleep(90);
 
-      expect(adapter.turnInProgress).toBe(false);
-      expect(events).toEqual(["completed"]);
+      expect(adapter.turnInProgress).toBe(true);
+      expect(adapter.activeTurnIds.has("watchdog-turn")).toBe(true);
+      expect(events).toEqual([]);
+      expect(stalled).toEqual([{ turnId: "watchdog-turn", inactivityMs: 40 }]);
 
       adapter.clearResponseTrackingState();
     });
@@ -480,13 +546,15 @@ describe("CodexAdapter turn state machine", () => {
     // - refresh via the unforwarded delta at t≈250 (≈150ms before the original
     //   deadline) pushes the deadline to t≈650.
     // - "still active" is asserted at t≈500 — PAST the original t≈400 deadline
-    //   (so WITHOUT the fix the watchdog would already have force-completed and
+    //   (so WITHOUT the fix the watchdog would already have marked stalled and
     //   this assertion fails) and ≈150ms before the refreshed t≈650 deadline.
-    // - "completed" is asserted at t≈750 (≈100ms past t≈650).
+    // - "stalled" is asserted at t≈750 (≈100ms past t≈650).
     await withTurnWatchdogMs(400, async () => {
       const adapter = createAdapter();
       const events: string[] = [];
+      const stalled: unknown[] = [];
       adapter.on("turnCompleted", () => events.push("completed"));
+      adapter.on("turnStalled", (event: unknown) => stalled.push(event));
 
       adapter.handleAppServerPayload(JSON.stringify({
         method: "turn/started",
@@ -507,11 +575,13 @@ describe("CodexAdapter turn state machine", () => {
       // Past the ORIGINAL deadline but before the refreshed one — still active.
       expect(adapter.turnInProgress).toBe(true);
       expect(events).toEqual([]);
+      expect(stalled).toEqual([]);
 
       await sleep(250);
 
-      expect(adapter.turnInProgress).toBe(false);
-      expect(events).toEqual(["completed"]);
+      expect(adapter.turnInProgress).toBe(true);
+      expect(events).toEqual([]);
+      expect(stalled).toHaveLength(1);
 
       adapter.clearResponseTrackingState();
     });
@@ -545,10 +615,12 @@ describe("CodexAdapter turn state machine", () => {
     });
   });
 
-  test("force-completing one of several active turns keeps busy state and defers the emit", () => {
+  test("stalled turns keep busy state and never emit completion", () => {
     const adapter = createAdapter();
     const events: string[] = [];
+    const stalled: string[] = [];
     adapter.on("turnCompleted", () => events.push("completed"));
+    adapter.on("turnStalled", (event: { turnId: string }) => stalled.push(event.turnId));
 
     // Two concurrent turns (driven via handleServerNotification so only their
     // own watchdogs arm — no global refresh between them).
@@ -557,18 +629,73 @@ describe("CodexAdapter turn state machine", () => {
     expect(adapter.activeTurnIds.size).toBe(2);
     expect(adapter.turnInProgress).toBe(true);
 
-    // One turn's watchdog fires: forceCompleteTurn must drop ONLY that turn,
-    // recompute busy from the remaining set, and NOT emit while a turn remains.
-    adapter.forceCompleteTurn("t1");
-    expect(adapter.activeTurnIds.has("t1")).toBe(false);
-    expect(adapter.turnWatchdogs.has("t1")).toBe(false);
+    adapter.markTurnStalled("t1");
+    expect(adapter.activeTurnIds.has("t1")).toBe(true);
     expect(adapter.turnInProgress).toBe(true);
     expect(events).toEqual([]);
+    expect(stalled).toEqual(["t1"]);
 
-    // The last turn completing flips to idle → exactly one emit.
-    adapter.forceCompleteTurn("t2");
+    adapter.markTurnStalled("t2");
+    expect(adapter.activeTurnIds.has("t2")).toBe(true);
+    expect(adapter.turnInProgress).toBe(true);
+    expect(events).toEqual([]);
+    expect(stalled).toEqual(["t1", "t2"]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("turnStalled is emitted at most once per turn but re-arms for a new turn", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    const stalled: string[] = [];
+    adapter.on("turnCompleted", () => events.push("completed"));
+    adapter.on("turnStalled", (event: { turnId: string }) => stalled.push(event.turnId));
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.turnInProgress).toBe(true);
+
+    // First stall notifies; the watchdog is intentionally kept armed (turn stays
+    // busy), so a later expiry re-invokes markTurnStalled for the SAME turn — but
+    // that must NOT emit a duplicate notification.
+    adapter.markTurnStalled("t1");
+    adapter.markTurnStalled("t1");
+    expect(stalled).toEqual(["t1"]);
+    // Busy semantics unchanged: still in progress, never force-completed.
+    expect(adapter.turnInProgress).toBe(true);
+    expect(adapter.activeTurnIds.has("t1")).toBe(true);
+    expect(events).toEqual([]);
+
+    // A genuinely new turn must be eligible to notify on its own stall.
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
     expect(adapter.turnInProgress).toBe(false);
     expect(events).toEqual(["completed"]);
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+    adapter.markTurnStalled("t2");
+    adapter.markTurnStalled("t2");
+    expect(stalled).toEqual(["t1", "t2"]);
+    expect(adapter.turnInProgress).toBe(true);
+    expect(events).toEqual(["completed"]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("turnStalled re-arms when the SAME turnId is reused by a fresh turn/started", () => {
+    // Real ids can repeat across reconnects: a new turn/started for an id that
+    // previously stalled must clear the suppression so the new turn can notify.
+    const adapter = createAdapter();
+    const stalled: string[] = [];
+    adapter.on("turnStalled", (event: { turnId: string }) => stalled.push(event.turnId));
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "reused" } } });
+    adapter.markTurnStalled("reused");
+    adapter.markTurnStalled("reused");
+    expect(stalled).toEqual(["reused"]);
+
+    // Same id starts a fresh turn — suppression must reset.
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "reused" } } });
+    adapter.markTurnStalled("reused");
+    expect(stalled).toEqual(["reused", "reused"]);
 
     adapter.clearResponseTrackingState();
   });
@@ -1235,6 +1362,62 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     }
     adapter.secondaryConnections.clear();
     adapter.clearResponseTrackingState();
+  });
+
+  test("secondary picker connection replays cached initialization before first non-initialize request", async () => {
+    const received: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        if (srv.upgrade(req)) return undefined;
+        return new Response("test app-server");
+      },
+      websocket: {
+        message(_ws, raw) {
+          received.push(typeof raw === "string" ? raw : raw.toString());
+        },
+      },
+    });
+
+    const adapter = new CodexAdapter(server.port, 4511) as any;
+    adapter.log = () => {};
+    adapter.connIdCounter = 1;
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = { data: { connId: 1 }, send: () => {} } as any;
+    adapter.lastInitializeRaw = JSON.stringify({
+      id: "initialize",
+      method: "initialize",
+      params: { clientInfo: { name: "codex-tui" } },
+    });
+    adapter.lastInitializedRaw = JSON.stringify({ method: "initialized" });
+
+    const secondaryWs = { data: { connId: 0 }, send: () => {}, close: () => {} } as any;
+    try {
+      adapter.onTuiConnect(secondaryWs);
+      adapter.onTuiMessage(secondaryWs, JSON.stringify({
+        id: 2,
+        method: "thread/list",
+        params: { limit: 25 },
+      }));
+
+      for (let i = 0; i < 40 && received.length < 3; i++) {
+        await sleep(25);
+      }
+
+      expect(received.map((raw) => JSON.parse(raw).method)).toEqual([
+        "initialize",
+        "initialized",
+        "thread/list",
+      ]);
+    } finally {
+      for (const sec of adapter.secondaryConnections.values()) {
+        try { sec.appServerWs?.close(); } catch {}
+      }
+      adapter.secondaryConnections.clear();
+      server.stop(true);
+      adapter.clearResponseTrackingState();
+    }
   });
 
   test("app-server close discards approval state across reconnects", () => {

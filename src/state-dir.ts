@@ -68,6 +68,10 @@ export class StateDirResolver {
     return join(this.stateDir, "ports.json");
   }
 
+  get currentThreadFile(): string {
+    return join(this.stateDir, "current-thread.json");
+  }
+
   get logFile(): string {
     return join(this.stateDir, "agentbridge.log");
   }

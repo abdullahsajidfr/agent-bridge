@@ -13,9 +13,12 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const require = createRequire(import.meta.url);
+const { agentBridgeInstallEnv } = require("./install-safety.cjs");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
 const packageName = pkg.name;
 
@@ -50,6 +53,7 @@ function run(cmd, commandArgs, options = {}) {
   const res = spawnSync(cmd, commandArgs, {
     cwd,
     encoding: "utf-8",
+    env: agentBridgeInstallEnv(process.env),
     stdio: captureStdout ? ["ignore", "pipe", "inherit"] : "inherit",
   });
 
@@ -79,8 +83,11 @@ function packedTarballFrom(stdout, destination) {
 
 function installLocal() {
   if (dryRun) {
+    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"]);
     printDry("bun", ["run", "prepublishOnly"]);
+    printDry("node", ["scripts/install-safety.cjs", "verify-built"]);
     printDry("npm", ["pack", "--pack-destination", "<temp>"]);
+    printDry("node", ["scripts/install-safety.cjs", "verify-tarball", "<packed-tarball>"]);
     printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", "<packed-tarball>"]);
     return;
@@ -88,10 +95,13 @@ function installLocal() {
 
   let packDir = "";
   try {
+    run("node", ["scripts/install-safety.cjs", "stop-running"]);
     run("bun", ["run", "prepublishOnly"]);
+    run("node", ["scripts/install-safety.cjs", "verify-built"]);
     packDir = mkdtempSync(join(tmpdir(), "agentbridge-pack-"));
     const packed = run("npm", ["pack", "--pack-destination", packDir], { captureStdout: true });
     const tarball = packedTarballFrom(packed.stdout ?? "", packDir);
+    run("node", ["scripts/install-safety.cjs", "verify-tarball", tarball]);
     run("npm", ["uninstall", "-g", packageName], { allowFailure: true });
     run("npm", ["install", "-g", "--force", tarball]);
     process.stdout.write(`install-global: installed ${packageName} globally from local source\n`);
@@ -103,12 +113,14 @@ function installLocal() {
 function installNpm() {
   const spec = `${packageName}@latest`;
   if (dryRun) {
+    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"]);
     printDry("npm", ["view", spec, "version"]);
     printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", spec]);
     return;
   }
 
+  run("node", ["scripts/install-safety.cjs", "stop-running"]);
   run("npm", ["view", spec, "version"]);
   run("npm", ["uninstall", "-g", packageName], { allowFailure: true });
   run("npm", ["install", "-g", "--force", spec]);

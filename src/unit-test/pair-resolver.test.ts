@@ -25,6 +25,7 @@ const ENV_KEYS = [
   "AGENTBRIDGE_CONTROL_PORT",
   "AGENTBRIDGE_PAIR_ID",
   "AGENTBRIDGE_PAIR_NAME",
+  "AGENTBRIDGE_MANUAL",
   "CODEX_WS_PORT",
   "CODEX_PROXY_PORT",
 ] as const;
@@ -120,8 +121,9 @@ describe("computeBaseDir", () => {
 });
 
 describe("applyPairEnv — manual/legacy mode", () => {
-  test("explicit port env + no --pair → manual, ports from env, registry untouched", async () => {
+  test("explicit port env + AGENTBRIDGE_MANUAL=1 + no --pair → manual, ports from env, registry untouched", async () => {
     const base = makeBase();
+    process.env.AGENTBRIDGE_MANUAL = "1";
     process.env.AGENTBRIDGE_STATE_DIR = base;
     process.env.AGENTBRIDGE_CONTROL_PORT = "4502";
     process.env.CODEX_WS_PORT = "4500";
@@ -135,6 +137,26 @@ describe("applyPairEnv — manual/legacy mode", () => {
     expect(res.ports).toEqual({ appPort: 4500, proxyPort: 4501, controlPort: 4502 });
     // Manual mode does not allocate a slot: no registry written under the base.
     expect(listPairs(base)).toEqual([]);
+  });
+
+  test("explicit port env without AGENTBRIDGE_MANUAL no longer enters implicit manual mode", async () => {
+    const base = makeBase();
+    const pairId = derivePairId(process.cwd(), "main");
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId, slot: 4, cwd: process.cwd(), name: "main", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
+    });
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+    process.env.AGENTBRIDGE_CONTROL_PORT = "4502";
+    process.env.CODEX_WS_PORT = "4500";
+    process.env.CODEX_PROXY_PORT = "4501";
+
+    const res = await applyPairEnv({});
+
+    expect(res.manual).toBe(false);
+    expect(res.pairId).toBe(pairId);
+    expect(process.env.AGENTBRIDGE_STATE_DIR).toContain(join(base, "pairs"));
+    expect(process.env.AGENTBRIDGE_CONTROL_PORT).toBe("4542");
   });
 });
 
@@ -240,27 +262,33 @@ describe("findPairForFlag — cwd-scoped name resolution (used by kill / pairs r
     expect(findPairForFlag(base, "/tmp/projY", "work")).toBeNull();
   });
 
-  test("falls back to a raw composite pairId regardless of cwd", () => {
+  test("falls back to a raw composite pairId only in the same cwd", () => {
     const base = makeBase();
     const cwd = "/tmp/projX";
     const pairId = seed(base, cwd, "work");
-    // From an unrelated cwd the friendly name won't resolve, but the raw id does.
-    expect(findPairForFlag(base, "/tmp/unrelated", pairId)?.pairId).toBe(pairId);
+    expect(findPairForFlag(base, cwd, pairId)?.pairId).toBe(pairId);
+    expect(findPairForFlag(base, "/tmp/unrelated", pairId)).toBeNull();
   });
 
-  test("trims a raw composite pairId flag (kill/pairs aligns with launch on whitespace)", () => {
+  test("trims a raw composite pairId flag for the same cwd (kill/pairs aligns with launch on whitespace)", () => {
     const base = makeBase();
     const cwd = "/tmp/projX";
     const pairId = seed(base, cwd, "work");
     // A flag with surrounding whitespace must resolve to the same pair as the trimmed
     // form — matching resolvePair (launch), which validates/trims before the raw match.
-    expect(findPairForFlag(base, "/tmp/unrelated", `  ${pairId}  `)?.pairId).toBe(pairId);
+    expect(findPairForFlag(base, cwd, `  ${pairId}  `)?.pairId).toBe(pairId);
+    expect(findPairForFlag(base, "/tmp/unrelated", `  ${pairId}  `)).toBeNull();
   });
 
-  test("reaches an OLD verbatim-id entry (no name field) via the raw fallback", () => {
+  test("reaches an OLD verbatim-id entry (no name field) via the raw fallback only in the same cwd", () => {
     const base = makeBase();
-    writeRegistry(base, { version: 1, pairs: [entry("work", 0)] }); // legacy shape
-    expect(findPairForFlag(base, "/tmp/anything", "work")?.pairId).toBe("work");
+    const cwd = "/tmp/anything";
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId: "work", slot: 0, cwd, source: "flag", createdAt: "2026-01-01T00:00:00.000Z" }],
+    }); // legacy shape
+    expect(findPairForFlag(base, cwd, "work")?.pairId).toBe("work");
+    expect(findPairForFlag(base, "/tmp/other", "work")).toBeNull();
   });
 
   test("throws PAIR_ID_INVALID for a malformed flag", () => {

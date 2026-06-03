@@ -87,10 +87,20 @@ function main() {
   const required = new Set([
     "dist/cli.js",
     "dist/daemon.js", // ← the omission that shipped the original broken package
+    ".claude-plugin/marketplace.json",
+    "plugins/agentbridge/.claude-plugin/plugin.json",
+    "plugins/agentbridge/.mcp.json",
+    "plugins/agentbridge/README.md",
+    "plugins/agentbridge/commands/init.md",
+    "plugins/agentbridge/hooks/hooks.json",
+    "plugins/agentbridge/scripts/health-check.sh",
+    "plugins/agentbridge/scripts/plugin-update-notice.mjs",
     "plugins/agentbridge/server/bridge-server.js",
     "plugins/agentbridge/server/daemon.js",
     "package.json",
     "README.md",
+    "scripts/install-safety.cjs",
+    "scripts/postinstall.cjs",
     ...binTargets,
   ]);
 

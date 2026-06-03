@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
+import { derivePairId, portsForSlot } from "./pair-registry";
 
 const CLI_PATH = fileURLToPath(new URL("./cli.ts", import.meta.url));
 const BRIDGE_PATH = fileURLToPath(new URL("./bridge.ts", import.meta.url));
@@ -34,6 +35,7 @@ interface PortReservation {
 class CliE2EHarness {
   readonly rootDir: string;
   readonly projectDir: string;
+  readonly baseDir: string;
   readonly stateDir: string;
   readonly binDir: string;
   readonly shimLogDir: string;
@@ -52,6 +54,7 @@ class CliE2EHarness {
   private constructor(
     rootDir: string,
     projectDir: string,
+    baseDir: string,
     stateDir: string,
     binDir: string,
     shimLogDir: string,
@@ -65,6 +68,7 @@ class CliE2EHarness {
   ) {
     this.rootDir = rootDir;
     this.projectDir = projectDir;
+    this.baseDir = baseDir;
     this.stateDir = stateDir;
     this.binDir = binDir;
     this.shimLogDir = shimLogDir;
@@ -85,12 +89,14 @@ class CliE2EHarness {
   static async create(options: HarnessOptions = {}): Promise<CliE2EHarness> {
     const rootDir = mkdtempSync(join(tmpdir(), "agentbridge-cli-e2e-"));
     const projectDir = join(rootDir, "project");
+    const baseDir = join(rootDir, "base");
     const stateDir = join(rootDir, "state");
     const binDir = join(rootDir, "bin");
     const shimLogDir = join(rootDir, "shim-logs");
     const fakeDaemonPath = join(rootDir, "agentbridge-fake-daemon.ts");
     const fakeDaemonLaunchLog = join(rootDir, "fake-daemon-launches.jsonl");
     mkdirSync(projectDir, { recursive: true });
+    mkdirSync(baseDir, { recursive: true });
     mkdirSync(stateDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
     mkdirSync(shimLogDir, { recursive: true });
@@ -135,13 +141,13 @@ class CliE2EHarness {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
-      // Strip any pair env leaked from a real `abg claude` session in the parent
-      // shell. computeBaseDir() prefers AGENTBRIDGE_BASE_DIR, so a leaked value
-      // would make the CLI read the developer's REAL registry instead of this
-      // test's tmp stateDir, breaking pair/kill isolation (undefined → omitted).
+      // Pair-mode CLI paths (`--pair ...`) use AGENTBRIDGE_BASE_DIR, while
+      // manual-mode paths below use AGENTBRIDGE_STATE_DIR. Keep both isolated
+      // under this harness root so tests never touch the developer's registry.
       AGENTBRIDGE_BASE_DIR: undefined,
       AGENTBRIDGE_PAIR_ID: undefined,
       AGENTBRIDGE_PAIR_NAME: undefined,
+      AGENTBRIDGE_MANUAL: "1",
       AGENTBRIDGE_STATE_DIR: stateDir,
       AGENTBRIDGE_CONTROL_PORT: String(controlPort),
       AGENTBRIDGE_DAEMON_ENTRY: fakeDaemonPath,
@@ -156,6 +162,7 @@ class CliE2EHarness {
     return new CliE2EHarness(
       rootDir,
       projectDir,
+      baseDir,
       stateDir,
       binDir,
       shimLogDir,
@@ -184,10 +191,7 @@ class CliE2EHarness {
 
     const proc = this.spawnProcess(process.execPath, ["run", CLI_PATH, ...args], {
       cwd: this.projectDir,
-      env: {
-        ...this.env,
-        ...extraEnv,
-      },
+      env: this.envForArgs(args, extraEnv),
     });
     return waitForExit(proc, timeoutMs);
   }
@@ -199,10 +203,7 @@ class CliE2EHarness {
 
     return this.spawnProcess(process.execPath, ["run", CLI_PATH, ...args], {
       cwd: this.projectDir,
-      env: {
-        ...this.env,
-        ...extraEnv,
-      },
+      env: this.envForArgs(args, extraEnv),
     });
   }
 
@@ -301,6 +302,15 @@ class CliE2EHarness {
       await sleep(100);
     }
 
+    for (const pid of this.readAllStatePids()) {
+      if (pid && isProcessAlive(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+        await sleep(100);
+      }
+    }
+
     for (const reservation of this.portReservations) {
       try {
         await reservation.release();
@@ -308,6 +318,25 @@ class CliE2EHarness {
     }
 
     rmSync(this.rootDir, { recursive: true, force: true });
+  }
+
+  private readAllStatePids(): number[] {
+    const pids: number[] = [];
+    const visit = (dir: string) => {
+      if (!existsSync(dir)) return;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(path);
+          continue;
+        }
+        if (entry.name !== "daemon.pid" && entry.name !== "codex-tui.pid") continue;
+        const pid = Number.parseInt(readFileSync(path, "utf-8").trim(), 10);
+        if (Number.isFinite(pid)) pids.push(pid);
+      }
+    };
+    visit(this.rootDir);
+    return [...new Set(pids)];
   }
 
   private async releaseDaemonPortReservations(): Promise<void> {
@@ -327,6 +356,14 @@ class CliE2EHarness {
     }
 
     await this.daemonPortReleasePromise;
+  }
+
+  private envForArgs(args: string[], extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    return {
+      ...this.env,
+      ...(usesPairMode(args) ? { AGENTBRIDGE_BASE_DIR: this.baseDir } : {}),
+      ...extraEnv,
+    };
   }
 
   private spawnProcess(
@@ -550,19 +587,23 @@ describe("E2E: CLI surface", () => {
 
   test("agentbridge kill --pair scopes the restart hint to that pair", async () => {
     await withHarness(async (harness) => {
-      const pairId = "work";
-      const pairStateDir = join(harness.stateDir, "pairs", pairId);
+      const pairName = "work";
+      const pairId = derivePairId(harness.projectDir, pairName);
+      const pairSlot = await reservePairSlot();
+      const pairStateDir = join(harness.baseDir, "pairs", pairId);
+      mkdirSync(join(harness.baseDir, "pairs"), { recursive: true });
       mkdirSync(pairStateDir, { recursive: true });
       writeFileSync(
-        join(harness.stateDir, "pairs", "registry.json"),
+        join(harness.baseDir, "pairs", "registry.json"),
         JSON.stringify(
           {
             version: 1,
             pairs: [
               {
                 pairId,
-                slot: 0,
+                slot: pairSlot.slot,
                 cwd: harness.projectDir,
+                name: pairName,
                 source: "flag",
                 createdAt: new Date().toISOString(),
               },
@@ -574,9 +615,8 @@ describe("E2E: CLI surface", () => {
         "utf-8",
       );
 
-      const pairPorts = await Promise.all([reservePort(), reservePort(), reservePort()]);
-      const [controlPort, appPort, proxyPort] = pairPorts.map((reservation) => reservation.port);
-      for (const reservation of pairPorts) {
+      const { appPort, proxyPort, controlPort } = pairSlot.ports;
+      for (const reservation of pairSlot.reservations) {
         await reservation.release();
       }
 
@@ -598,7 +638,7 @@ describe("E2E: CLI surface", () => {
       try {
         await waitFor(() => existsSync(join(pairStateDir, "daemon.pid")), 80, 50);
 
-        const result = await harness.runCli(["kill", "--pair", pairId]);
+        const result = await harness.runCli(["kill", "--pair", pairName]);
 
         expect(result.code).toBe(0);
         expect(result.stdout).toContain("AgentBridge stopped.");
@@ -862,6 +902,61 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function usesPairMode(args: string[]): boolean {
+  return args.some((arg) => arg === "--pair" || arg.startsWith("--pair="));
+}
+
+async function reservePairSlot(): Promise<{ slot: number; ports: ReturnType<typeof portsForSlot>; reservations: PortReservation[] }> {
+  for (let slot = 20; slot < 200; slot++) {
+    const ports = portsForSlot(slot);
+    const reservations: PortReservation[] = [];
+    try {
+      reservations.push(await reserveSpecificPort(ports.appPort));
+      reservations.push(await reserveSpecificPort(ports.proxyPort));
+      reservations.push(await reserveSpecificPort(ports.controlPort));
+      return { slot, ports, reservations };
+    } catch {
+      for (const reservation of reservations) {
+        try {
+          await reservation.release();
+        } catch {}
+      }
+    }
+  }
+  throw new Error("No free AgentBridge pair slot available for test");
+}
+
+async function reserveSpecificPort(port: number): Promise<PortReservation> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.unref();
+
+      let released = false;
+      resolve({
+        port,
+        release: () => new Promise<void>((releaseResolve, releaseReject) => {
+          if (released) {
+            releaseResolve();
+            return;
+          }
+
+          released = true;
+          server.close((err) => {
+            if (err) {
+              releaseReject(err);
+              return;
+            }
+            releaseResolve();
+          });
+        }),
+      });
+    });
+  });
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -935,6 +1030,12 @@ const statusFile = join(stateDir, "status.json");
 const killedFile = join(stateDir, "killed");
 const proxyUrl = \`ws://127.0.0.1:\${proxyPort}\`;
 const appServerUrl = \`ws://127.0.0.1:\${appPort}\`;
+const build = {
+  version: "0.0.0-source",
+  commit: "source",
+  bundle: "source",
+  contractVersion: 1,
+};
 
 if (existsSync(killedFile)) {
   process.exit(0);
@@ -958,6 +1059,10 @@ function currentStatus() {
     proxyUrl,
     appServerUrl,
     pid: process.pid,
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir,
+    build,
   };
 }
 
@@ -966,6 +1071,10 @@ writeFileSync(statusFile, JSON.stringify({
   appServerUrl,
   controlPort,
   pid: process.pid,
+  pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+  cwd: process.cwd(),
+  stateDir,
+  build,
 }, null, 2) + "\\n", "utf-8");
 
 let cleanedUp = false;

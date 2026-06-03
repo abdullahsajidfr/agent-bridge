@@ -100,7 +100,8 @@ export type PairErrorCode =
   | "PAIR_ID_INVALID"
   | "PAIR_LOCK_TIMEOUT"
   | "PAIR_REGISTRY_CORRUPT"
-  | "PAIR_LEGACY_ROOT_DAEMON";
+  | "PAIR_LEGACY_ROOT_DAEMON"
+  | "PAIR_CROSS_CWD";
 
 export class PairError extends Error {
   readonly code: PairErrorCode;
@@ -639,6 +640,15 @@ export interface ResolvePairOptions {
 }
 
 /**
+ * Outcome of the under-lock allocation pass. Either a resolved slot/entry, or a
+ * cross-cwd sentinel that defers a PAIR_CROSS_CWD throw until the lock is released
+ * (throwing while holding the registry lock would strand it).
+ */
+type PairAllocation =
+  | { slot: number; entry: PairEntry; isNew: boolean; matchedRaw: boolean }
+  | { crossCwd: PairEntry };
+
+/**
  * Resolve (and, if new, allocate) the pair for this invocation.
  *
  * Allocation happens under the cross-process lock; port probing happens after
@@ -671,10 +681,11 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   const source: PairEntry["source"] = hasFlag ? "flag" : "cwd";
   const lower = pairId.toLowerCase();
   // Raw match key: the flag verbatim (validated/trimmed into `name`), in case it is
-  // ALREADY a full pairId copied from `abg pairs` (which is cwd-independent).
+  // ALREADY a full pairId copied from `abg pairs` (reused only for the SAME cwd; a
+  // cross-cwd raw match is rejected below).
   const flagLower = name.toLowerCase();
 
-  const { slot, entry, isNew, matchedRaw } = await withRegistryLock(base, () => {
+  const allocation = await withRegistryLock(base, (): PairAllocation => {
     const reg = readRegistry(base);
     // 1) Scoped (name + cwd) match first: a friendly name in THIS directory always
     //    wins, so normal `--pair main` is unaffected and a foreign raw pairId can
@@ -685,9 +696,20 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     //    Mirrors findPairForFlag() so a launch (`abg --pair <id> codex`) agrees with
     //    kill/pairs, and fixes the double-hash strand where passing a full pairId
     //    silently spawned a brand-new empty pair with no peer.
+    //
+    //    A pair is scoped to its directory: only reuse a raw match when it belongs to
+    //    THIS cwd (the `abg --pair <pairId>` same-dir recovery path). A raw match from a
+    //    DIFFERENT cwd is an error — return a sentinel and throw AFTER releasing the lock
+    //    (never throw while holding it). The identity layer would reject a cross-cwd
+    //    attach anyway, so failing loud here keeps the two layers in agreement.
     if (hasFlag) {
       const raw = reg.pairs.find((p) => p.pairId.toLowerCase() === flagLower);
-      if (raw) return { slot: raw.slot, entry: raw, isNew: false, matchedRaw: true };
+      if (raw) {
+        if (raw.cwd === opts.cwd) {
+          return { slot: raw.slot, entry: raw, isNew: false, matchedRaw: true };
+        }
+        return { crossCwd: raw };
+      }
     }
 
     // 3) No match → allocate a fresh slot for the cwd-scoped pairId.
@@ -719,6 +741,21 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     return { slot: newSlot, entry: newEntry, isNew: true, matchedRaw: false };
   });
 
+  // Cross-cwd raw match: thrown OUTSIDE the lock. A pair is scoped to its directory,
+  // so passing a full pairId from another directory is an error, not a silent reuse.
+  if ("crossCwd" in allocation) {
+    const raw = allocation.crossCwd;
+    throw new PairError(
+      "PAIR_CROSS_CWD",
+      `--pair ${opts.pairFlag ?? name} refers to pair "${raw.pairId}" registered for ${raw.cwd}, ` +
+        `but you are in ${opts.cwd}. A pair is scoped to its directory — cd into that directory ` +
+        `to use it, or pass a short name to create/use a pair here.`,
+      { pairId: raw.pairId, registeredCwd: raw.cwd, cwd: opts.cwd },
+    );
+  }
+
+  const { slot, entry, isNew, matchedRaw } = allocation;
+
   const ports = portsForSlot(slot);
 
   // Probe ports ONLY for a brand-new slot allocation. For an existing pair
@@ -726,14 +763,14 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   // same-pair launch may be mid-bind — so we defer conflict detection to the
   // daemon's own bind + health check rather than risk a false PAIR_PORTS_BUSY.
   //
-  // Note: a new entry is durably committed (under the lock) before this probe.
-  // A probe failure leaves a reserved "ghost" slot that a re-run reuses
-  // idempotently or that `abg pairs rm` clears. Probing is a best-effort
-  // external-squatter check, not a correctness guarantee (port use is TOCTOU);
-  // the daemon's bind is the final arbiter.
+  // Note: probing is a best-effort external-squatter check, not a correctness
+  // guarantee (port use is TOCTOU); the daemon's bind is the final arbiter.
+  // If probing fails, remove the just-created registry entry under the lock so
+  // a transient external squatter does not strand a ghost slot.
   if (isNew && opts.probePorts !== false) {
     for (const port of [ports.appPort, ports.proxyPort, ports.controlPort]) {
       if (!(await probePortFree(port))) {
+        await removeAllocatedPairIfUnchanged(base, pairId, slot);
         throw new PairError(
           "PAIR_PORTS_BUSY",
           `Port ${port} (pair "${pairId}", slot ${slot}) is already in use by another process. ` +
@@ -748,21 +785,18 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   // NOT the caller's casing — otherwise `--pair Foo` then `--pair foo` would split
   // one logical pair across two state dirs on a case-sensitive filesystem.
   // `entry.name` is backfilled for entries written before the `name` field shipped.
-  // Non-blocking advisory for two confusing cases (CLI prints to stderr; never
-  // thrown, never persisted). matchedRaw implies isNew === false, so these are
-  // mutually exclusive.
+  // Non-blocking advisory (CLI prints to stderr; never thrown, never persisted).
+  // A raw match is now only ever a SAME-cwd recovery (cross-cwd throws above), so the
+  // sole remaining advisory is the pairId-shaped flag that matched nothing.
   let warning: string | undefined;
-  if (matchedRaw && entry.cwd !== opts.cwd) {
-    warning =
-      `--pair ${opts.pairFlag ?? name} matched pair "${entry.pairId}" registered for ${entry.cwd} ` +
-      `(you are in ${opts.cwd}); reusing it. Pass a short name (e.g. "${entry.name ?? DEFAULT_PAIR_NAME}") ` +
-      `if you meant a pair in THIS directory.`;
-  } else if (isNew && hasFlag && /-[0-9a-f]{8}$/i.test(name)) {
+  if (isNew && hasFlag && /-[0-9a-f]{8}$/i.test(name)) {
     warning =
       `--pair ${opts.pairFlag ?? name} looks like a full pair id, but no registered pair matched; ` +
       `creating a NEW pair named "${name}". Pass a short name (e.g. "main") or run \`abg pairs\` ` +
       `to see existing pairs.`;
   }
+  // matchedRaw (same-cwd recovery) intentionally produces no warning.
+  void matchedRaw;
 
   return {
     pairId: entry.pairId,
@@ -773,6 +807,15 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     entry,
     warning,
   };
+}
+
+async function removeAllocatedPairIfUnchanged(base: string, pairId: string, slot: number): Promise<void> {
+  await withRegistryLock(base, () => {
+    const reg = readRegistry(base);
+    const nextPairs = reg.pairs.filter((pair) => !(pair.pairId === pairId && pair.slot === slot));
+    if (nextPairs.length === reg.pairs.length) return;
+    writeRegistry(base, { version: 1, pairs: nextPairs });
+  });
 }
 
 /** Remove a pair entry from the registry (frees its slot). Returns the removed entry or null. */

@@ -56,6 +56,18 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
+async function bindFirstAvailableAppPortSlot(): Promise<{ slot: number; server: Server }> {
+  for (let slot = 0; slot <= MAX_PAIR_SLOT; slot++) {
+    try {
+      return { slot, server: await bindPort(portsForSlot(slot).appPort) };
+    } catch (err: any) {
+      if (err?.code === "EADDRINUSE" || err?.code === "EACCES") continue;
+      throw err;
+    }
+  }
+  throw new Error("No bindable AgentBridge app port slot found for test");
+}
+
 describe("portsForSlot", () => {
   test("slot 0 maps to the classic 4500/4501/4502 triple", () => {
     expect(portsForSlot(0)).toEqual({ appPort: 4500, proxyPort: 4501, controlPort: 4502 });
@@ -299,22 +311,16 @@ describe("resolvePair", () => {
     rmSync(base, { recursive: true, force: true });
   });
 
-  // resolvePair probes the slot's ports AFTER releasing the lock. Slot 0 maps
-  // to 4500/4501/4502, which may be occupied by a real dev-machine daemon — in
-  // that case resolvePair throws PAIR_PORTS_BUSY. The registry/slot allocation
-  // happens under the lock BEFORE probing, so allocation is durable regardless
-  // of the probe outcome. These helpers assert allocation via the registry and
-  // tolerate a PAIR_PORTS_BUSY thrown by the port probe.
+  // These tests exercise pure pair/slot allocation. Disable port probing so
+  // they do not depend on whether a developer-machine daemon currently owns
+  // the classic 4500/4501/4502 ports; port conflicts are covered separately.
 
-  // Run resolvePair, returning either the resolved pair or the PairError it
-  // threw. Re-throws anything that is not a PAIR_PORTS_BUSY PairError so real
-  // failures still surface.
   async function resolveTolerant(
     cwd: string,
     pairFlag?: string,
   ): Promise<{ ok: true; resolved: Awaited<ReturnType<typeof resolvePair>> } | { ok: false; busy: PairError }> {
     try {
-      const resolved = await resolvePair(base, pairFlag ? { pairFlag, cwd } : { cwd });
+      const resolved = await resolvePair(base, pairFlag ? { pairFlag, cwd, probePorts: false } : { cwd, probePorts: false });
       return { ok: true, resolved };
     } catch (err) {
       if (err instanceof PairError && err.code === "PAIR_PORTS_BUSY") {
@@ -331,7 +337,6 @@ describe("resolvePair", () => {
       const expectedId = derivePairId(tmpA, DEFAULT_PAIR_NAME);
       const r = await resolveTolerant(tmpA);
 
-      // Allocation must have happened regardless of probe result.
       const reg = readRegistry(base);
       expect(reg.pairs).toHaveLength(1);
       expect(reg.pairs[0]!.slot).toBe(0);
@@ -489,7 +494,7 @@ describe("resolvePair", () => {
     }
   });
 
-  test("a cross-cwd raw pairId match reuses the pair AND warns", async () => {
+  test("a cross-cwd raw pairId match THROWS PAIR_CROSS_CWD (a pair is scoped to its directory)", async () => {
     const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-xcwd-A-"));
     const tmpB = mkdtempSync(join(tmpdir(), "abg-pair-xcwd-B-"));
     try {
@@ -498,20 +503,48 @@ describe("resolvePair", () => {
         version: 1,
         pairs: [{ pairId, slot: 6, cwd: tmpA, name: DEFAULT_PAIR_NAME, source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
       });
-      // Resolve the SAME pairId from a DIFFERENT directory.
-      const resolved = await resolvePair(base, { pairFlag: pairId, cwd: tmpB, probePorts: false });
-
-      expect(resolved.pairId).toBe(pairId);
-      expect(resolved.slot).toBe(6); // reused, not reallocated
-      expect(readRegistry(base).pairs).toHaveLength(1);
-      expect(resolved.warning).toBeDefined();
-      expect(resolved.warning!).toContain(tmpA); // the pair's home cwd
-      expect(resolved.warning!).toContain(tmpB); // where the user actually is
+      // Resolve the SAME pairId from a DIFFERENT directory: must be an error, not a
+      // silent reuse — the identity layer would reject a cross-cwd attach anyway.
+      let err: unknown;
+      try {
+        await resolvePair(base, { pairFlag: pairId, cwd: tmpB, probePorts: false });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(PairError);
+      expect((err as PairError).code).toBe("PAIR_CROSS_CWD");
+      const message = (err as PairError).message;
+      expect(message).toContain(tmpA); // the pair's home cwd
+      expect(message).toContain(tmpB); // where the user actually is
       // Guard the flag→text spacing (a replace_all once ate this space).
-      expect(resolved.warning!).toContain(`--pair ${pairId} matched`);
+      expect(message).toContain(`--pair ${pairId} refers to`);
+      // Nothing reused, nothing reallocated, registry untouched.
+      expect(readRegistry(base).pairs).toHaveLength(1);
+      expect((err as PairError).details).toMatchObject({ pairId, registeredCwd: tmpA, cwd: tmpB });
     } finally {
       rmSync(tmpA, { recursive: true, force: true });
       rmSync(tmpB, { recursive: true, force: true });
+    }
+  });
+
+  test("a same-cwd full pairId recovers (reuses) the entry without a warning", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-samecwd-A-"));
+    try {
+      // The pairId-shaped flag IS the registered pair's id AND we are in its dir:
+      // this is the `abg --pair <pairId>` same-dir recovery path (commit 400b737).
+      const pairId = derivePairId(tmpA, DEFAULT_PAIR_NAME);
+      writeRegistry(base, {
+        version: 1,
+        pairs: [{ pairId, slot: 5, cwd: tmpA, name: DEFAULT_PAIR_NAME, source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
+      });
+      const resolved = await resolvePair(base, { pairFlag: pairId, cwd: tmpA, probePorts: false });
+
+      expect(resolved.pairId).toBe(pairId);
+      expect(resolved.slot).toBe(5); // reused, not reallocated
+      expect(readRegistry(base).pairs).toHaveLength(1); // nothing allocated
+      expect(resolved.warning).toBeUndefined(); // same-cwd recovery is silent
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
     }
   });
 
@@ -651,10 +684,15 @@ describe("cross-review regression fixes", () => {
 
   test("a brand-new pair whose port is squatted reports PAIR_PORTS_BUSY (deterministic)", async () => {
     const base = tmpBase();
-    // Occupy slots 0 and 1 so the new pair deterministically lands on slot 2.
-    writeRegistry(base, { version: 1, pairs: [entry(0, "a"), entry(1, "b")] });
-    const slot2 = portsForSlot(2);
-    const server = await bindPort(slot2.appPort); // squat 4520
+    const { slot, server } = await bindFirstAvailableAppPortSlot();
+    const ports = portsForSlot(slot);
+    // Occupy all lower slots in the registry so the new pair deterministically
+    // lands on the app port we are squatting, without assuming any fixed port is
+    // free on the developer machine.
+    writeRegistry(base, {
+      version: 1,
+      pairs: Array.from({ length: slot }, (_, s) => entry(s, `occupied-${s}`)),
+    });
     try {
       let caught: unknown;
       try {
@@ -664,7 +702,10 @@ describe("cross-review regression fixes", () => {
       }
       expect(caught).toBeInstanceOf(PairError);
       expect((caught as PairError).code).toBe("PAIR_PORTS_BUSY");
-      expect((caught as PairError).details?.port).toBe(slot2.appPort);
+      expect((caught as PairError).details?.port).toBe(ports.appPort);
+      const registryAfterFailure = readRegistry(base);
+      expect(registryAfterFailure.pairs.some((pair) => pair.name === "c")).toBe(false);
+      expect(registryAfterFailure.pairs.some((pair) => pair.slot === slot)).toBe(false);
     } finally {
       await closeServer(server);
     }

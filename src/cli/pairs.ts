@@ -9,6 +9,7 @@ import {
   removePair,
 } from "../pair-resolver";
 import { StateDirResolver } from "../state-dir";
+import { readRawCurrentThread } from "../thread-state";
 import { stopPairEntry } from "./kill";
 
 interface PairRow {
@@ -20,6 +21,9 @@ interface PairRow {
   cwd: string;
   running: boolean;
   pid: number | null;
+  threadId: string | null;
+  threadStatus: string | null;
+  threadUpdatedAt: string | null;
 }
 
 export async function runPairs(args: string[] = []) {
@@ -30,19 +34,20 @@ export async function runPairs(args: string[] = []) {
     return;
   }
 
-  if (command && command !== "list" && command !== "--json") {
+  if (command && command !== "list" && command !== "--json" && command !== "--threads") {
     console.error(`Unknown pairs command: ${command}`);
-    console.error("Usage: abg pairs [--json] | abg pairs rm <name|id>");
+    console.error("Usage: abg pairs [--json] [--threads] | abg pairs rm <name|id>");
     process.exit(1);
   }
 
   const json = command === "--json" || rest.includes("--json");
+  const includeThreads = rest.includes("--threads") || args.includes("--threads");
   const rows = await collectRows();
   if (json) {
     console.log(JSON.stringify(rows, null, 2));
     return;
   }
-  printTable(rows);
+  printTable(rows, { includeThreads });
 }
 
 async function runRemove(args: string[]) {
@@ -91,6 +96,9 @@ async function collectRows(): Promise<PairRow[]> {
       cwd: base,
       running: true,
       pid: legacy.pid,
+      threadId: null,
+      threadStatus: null,
+      threadUpdatedAt: null,
     });
   }
   return rows;
@@ -108,6 +116,7 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
     lifecycle.isHealthy(),
     Promise.resolve(lifecycle.readStatus()),
   ]);
+  const thread = readRawCurrentThread(stateDir);
 
   return {
     pairId: pair.pairId,
@@ -118,10 +127,13 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
     cwd: pair.cwd,
     running,
     pid: typeof status?.pid === "number" ? status.pid : null,
+    threadId: thread?.threadId ?? null,
+    threadStatus: thread?.status ?? null,
+    threadUpdatedAt: thread?.updatedAt ?? null,
   };
 }
 
-function printTable(rows: PairRow[]) {
+function printTable(rows: PairRow[], options: { includeThreads?: boolean } = {}) {
   if (rows.length === 0) {
     console.log("No pairs registered.");
     return;
@@ -136,6 +148,8 @@ function printTable(rows: PairRow[]) {
     cwd: row.cwd,
     status: row.running ? "running" : "stopped",
     pid: row.pid === null ? "-" : String(row.pid),
+    thread: row.threadId === null ? "-" : row.threadId,
+    threadStatus: row.threadStatus === null ? "-" : row.threadStatus,
   }));
 
   const headers = {
@@ -146,10 +160,15 @@ function printTable(rows: PairRow[]) {
     source: "source",
     status: "status",
     pid: "pid",
+    thread: "threadId",
+    threadStatus: "thread",
     cwd: "cwd",
   };
+  const visibleKeys = options.includeThreads
+    ? ["name", "pairId", "slot", "ports", "source", "status", "pid", "thread", "threadStatus", "cwd"] as const
+    : ["name", "pairId", "slot", "ports", "source", "status", "pid", "cwd"] as const;
   const widths = Object.fromEntries(
-    Object.keys(headers).map((key) => [
+    visibleKeys.map((key) => [
       key,
       Math.max(
         headers[key as keyof typeof headers].length,
@@ -159,29 +178,11 @@ function printTable(rows: PairRow[]) {
   ) as Record<keyof typeof headers, number>;
 
   const line = (row: Record<keyof typeof headers, string>) =>
-    [
-      row.name.padEnd(widths.name),
-      row.pairId.padEnd(widths.pairId),
-      row.slot.padEnd(widths.slot),
-      row.ports.padEnd(widths.ports),
-      row.source.padEnd(widths.source),
-      row.status.padEnd(widths.status),
-      row.pid.padEnd(widths.pid),
-      row.cwd,
-    ].join("  ");
+    visibleKeys.map((key) => row[key].padEnd(widths[key])).join("  ");
 
   console.log(line(headers));
   console.log(
-    [
-      "-".repeat(widths.name),
-      "-".repeat(widths.pairId),
-      "-".repeat(widths.slot),
-      "-".repeat(widths.ports),
-      "-".repeat(widths.source),
-      "-".repeat(widths.status),
-      "-".repeat(widths.pid),
-      "-".repeat(widths.cwd),
-    ].join("  "),
+    visibleKeys.map((key) => "-".repeat(widths[key])).join("  "),
   );
   for (const row of data) {
     console.log(line(row));

@@ -4,8 +4,9 @@ import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_PAIR_MISMATCH,
 } from "./control-protocol";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
@@ -16,6 +17,10 @@ interface DaemonClientEvents {
 }
 
 let nextSocketId = 0;
+
+export interface DaemonClientOptions {
+  identity?: ControlClientIdentity;
+}
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
@@ -29,7 +34,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
   >();
 
-  constructor(private readonly url: string) {
+  constructor(private readonly url: string, private readonly options: DaemonClientOptions = {}) {
     super();
   }
 
@@ -77,15 +82,18 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    this.send({
+      type: "claude_connect",
+      ...(this.options.identity ? { identity: this.options.identity } : {}),
+    });
   }
 
-  async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<boolean> {
+  async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<DaemonStatus | null> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
+      return null;
     }
 
-    return await new Promise<boolean>((resolve) => {
+    return await new Promise<DaemonStatus | null>((resolve) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -101,27 +109,27 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         this.off("disconnect", onDisconnect);
       };
 
-      const finish = (value: boolean) => {
+      const finish = (value: DaemonStatus | null) => {
         cleanup();
         resolve(value);
       };
 
-      const onStatus = () => finish(true);
-      const onRejected = () => finish(false);
-      const onDisconnect = () => finish(false);
+      const onStatus = (status: DaemonStatus) => finish(status);
+      const onRejected = () => finish(null);
+      const onDisconnect = () => finish(null);
 
       this.on("status", onStatus);
       this.on("rejected", onRejected);
       this.on("disconnect", onDisconnect);
 
       timer = setTimeout(() => {
-        finish(false);
+        finish(null);
       }, timeoutMs);
 
       try {
         this.attachClaude();
       } catch {
-        finish(false);
+        finish(null);
       }
     });
   }
@@ -250,7 +258,8 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         if (
           event.code === CLOSE_CODE_REPLACED ||
           event.code === CLOSE_CODE_EVICTED_STALE ||
-          event.code === CLOSE_CODE_PROBE_IN_PROGRESS
+          event.code === CLOSE_CODE_PROBE_IN_PROGRESS ||
+          event.code === CLOSE_CODE_PAIR_MISMATCH
         ) {
           this.emit("rejected", event.code);
         } else {

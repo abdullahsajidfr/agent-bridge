@@ -1,4 +1,5 @@
 import { spawn, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   openSync,
   writeSync,
@@ -6,16 +7,24 @@ import {
   writeFileSync,
   readFileSync,
   unlinkSync,
-  appendFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { checkAgentsMdContract } from "../agents-contract";
 import { ConfigService } from "../config-service";
+import { BUILD_INFO } from "../build-info";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "../env-guard";
 import { pairScopedCommand } from "../pair-command";
+import { appendRotatingLog } from "../rotating-log";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
+import {
+  readUsableCurrentThread,
+  type CurrentThreadState,
+} from "../thread-state";
+import { appendTraceEvent, pickRelevantEnv, redactArgv } from "../trace-log";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /**
@@ -29,7 +38,7 @@ function appendWrapperLog(path: string, entry: string): void {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
-    appendFileSync(path, `[${new Date().toISOString()}] ${entry}\n`, "utf-8");
+    appendRotatingLog(path, `[${new Date().toISOString()}] ${entry}\n`);
   } catch {
     /* ignore */
   }
@@ -93,6 +102,91 @@ export interface BuildArgsResult {
   injectedBridgeFlags: boolean;
 }
 
+export interface AgentBridgeCodexArgs {
+  rest: string[];
+  forceNew: boolean;
+  resumeCurrent: boolean;
+}
+
+export interface ResolveCodexResumeResult {
+  rest: string[];
+  mode: "new" | "auto-resume" | "resume-current" | "passthrough";
+  thread?: CurrentThreadState;
+  error?: string;
+}
+
+export function parseAgentBridgeCodexArgs(args: string[]): AgentBridgeCodexArgs {
+  const rest: string[] = [];
+  let forceNew = false;
+  let resumeCurrent = false;
+
+  for (const arg of args) {
+    if (arg === "--new") {
+      forceNew = true;
+      continue;
+    }
+    if (arg === "resume-current") {
+      resumeCurrent = true;
+      continue;
+    }
+    rest.push(arg);
+  }
+
+  return { rest, forceNew, resumeCurrent };
+}
+
+export function resolveCodexResumeArgs(
+  parsed: AgentBridgeCodexArgs,
+  pair: PairResolution,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolveCodexResumeResult {
+  if (parsed.forceNew && parsed.resumeCurrent) {
+    return {
+      rest: parsed.rest,
+      mode: "new",
+      error: "`--new` cannot be combined with `resume-current`.",
+    };
+  }
+
+  if (parsed.forceNew) {
+    return { rest: parsed.rest, mode: "new" };
+  }
+
+  const identity = {
+    stateDir: pair.stateDir,
+    pairId: pair.manual ? null : pair.pairId,
+    pairName: pair.name,
+    cwd: process.cwd(),
+  };
+
+  const current = readUsableCurrentThread(identity, env);
+  if (parsed.resumeCurrent) {
+    if (!current) {
+      return {
+        rest: parsed.rest,
+        mode: "resume-current",
+        error:
+          "No verified current Codex thread for this pair. Start a new one with `abg codex --new`, or resume a specific thread with `abg codex resume <threadId>`.",
+      };
+    }
+    return {
+      rest: ["resume", current.threadId, ...parsed.rest],
+      mode: "resume-current",
+      thread: current,
+    };
+  }
+
+  if (parsed.rest.length === 0 && current) {
+    return {
+      rest: ["resume", current.threadId],
+      mode: "auto-resume",
+      thread: current,
+    };
+  }
+
+  return { rest: parsed.rest, mode: "passthrough" };
+}
+
 /**
  * Build the final codex command-line arguments, positioning bridge flags so
  * clap parses them as options of the actually-invoked (sub)command.
@@ -126,54 +220,40 @@ export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsR
   return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
 }
 
-/**
- * Best-effort warning when the project's AGENTS.md has an AgentBridge marker block
- * from an OLDER version that predates the collaboration contract now living in
- * AGENTS.md. The daemon no longer appends that contract (message markers /
- * git-write rules / role guidance) to every message, so an un-refreshed AGENTS.md
- * would leave Codex without it. Read-only; never blocks startup; silent when there
- * is no block (project simply hasn't been `abg init`-ed in this dir).
- */
-function warnIfStaleAgentsMdContract(cwd: string): void {
-  try {
-    const agentsPath = join(cwd, "AGENTS.md");
-    if (!existsSync(agentsPath)) return;
-    const content = readFileSync(agentsPath, "utf-8");
-    if (!content.includes("<!-- AgentBridge:start -->")) return; // no block → not an upgrade-drift case
-    if (content.includes("Git operations — FORBIDDEN for you")) return; // already has the new contract
-    console.error(
-      "[agentbridge] ⚠️ Your AGENTS.md AgentBridge block predates the Codex collaboration contract " +
-        "(message markers / git-write rules / role guidance).",
-    );
-    console.error(
-      "[agentbridge]    Re-run `abg init` to refresh it — Codex now relies on AGENTS.md for that contract " +
-        "(it is no longer injected into every message).",
-    );
-  } catch {
-    /* best-effort; never block startup */
-  }
-}
-
 export async function runCodex(args: string[]) {
+  const originalEnv = { ...process.env };
+  const envGuardResult = guardAgentBridgeEnv({
+    cwd: process.cwd(),
+    env: process.env,
+    mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
+    allowStrict: true,
+    log: (msg) => console.error(msg),
+  });
+
   // Strip `--pair <name>` first; the rest flows through to codex.
   const { pairFlag, rest } = parsePairFlag(args);
+  const wrapperArgs = parseAgentBridgeCodexArgs(rest);
 
-  // Read-only nudge if this project's AGENTS.md contract block is stale (pre-upgrade).
-  warnIfStaleAgentsMdContract(process.cwd());
+  // AGENTS.md is managed exclusively by `abg init`. Startup never writes or
+  // blocks on it — only nudge once on stderr if the contract is missing/stale.
+  const agentsContract = checkAgentsMdContract(process.cwd());
+  if (!agentsContract.fresh) {
+    console.error(`[agentbridge] ${agentsContract.message}`);
+  }
 
-  // Check for owned flag conflicts (on the real codex args, not the pair flag).
-  checkOwnedFlagConflicts(rest, "agentbridge codex", OWNED_FLAGS);
+  // Check for owned flag conflicts (on the real codex args, not the pair flag or wrapper flags).
+  checkOwnedFlagConflicts(wrapperArgs.rest, "agentbridge codex", OWNED_FLAGS);
 
   // Specifically check for --enable tui_app_server (not all --enable values)
-  for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === "--enable" && rest[i + 1] === "tui_app_server") {
+  for (let i = 0; i < wrapperArgs.rest.length; i++) {
+    if (wrapperArgs.rest[i] === "--enable" && wrapperArgs.rest[i + 1] === "tui_app_server") {
       console.error(`Error: "--enable tui_app_server" is automatically set by agentbridge codex.`);
       console.error("");
       console.error("If you need full control over these flags, use the native command directly:");
       console.error("  codex [your flags here]");
       process.exit(1);
     }
-    if (rest[i] === "--enable=tui_app_server") {
+    if (wrapperArgs.rest[i] === "--enable=tui_app_server") {
       console.error(`Error: "--enable=tui_app_server" is automatically set by agentbridge codex.`);
       console.error("");
       console.error("If you need full control over these flags, use the native command directly:");
@@ -193,9 +273,13 @@ export async function runCodex(args: string[]) {
   }
 
   if (pair.warning) console.error(`[agentbridge] ⚠️  ${pair.warning}`);
+  if (process.env.AGENTBRIDGE_TRACE === "1") {
+    traceCliStart("cli.codex.start", args, originalEnv, envGuardResult.action, pair);
+  }
 
   const stateDir = pair.stateDir;
   const controlPort = pair.ports.controlPort;
+  guardNoLiveManagedTui(stateDir);
 
   const lifecycle = new DaemonLifecycle({
     stateDir,
@@ -297,7 +381,16 @@ export async function runCodex(args: string[]) {
     }
   }
 
-  const { fullArgs } = buildCodexArgs(rest, proxyUrl);
+  const resumeArgs = resolveCodexResumeArgs(wrapperArgs, pair);
+  if (resumeArgs.error) {
+    console.error(`[agentbridge] ${resumeArgs.error}`);
+    process.exit(1);
+  }
+  if (resumeArgs.mode === "auto-resume" || resumeArgs.mode === "resume-current") {
+    console.error(`[agentbridge] Resuming current Codex thread ${resumeArgs.thread!.threadId}`);
+  }
+
+  const { fullArgs } = buildCodexArgs(resumeArgs.rest, proxyUrl);
 
   // Capture the last 64KB of child stderr so the "ERROR: ..." line from
   // codex-rs on ExitReason::Fatal survives even when stdio is inherited by
@@ -309,7 +402,7 @@ export async function runCodex(args: string[]) {
   stateDir.ensure();
   appendWrapperLog(
     wrapperLogPath,
-    `spawn: codex ${fullArgs.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`,
+    `spawn: codex ${redactArgv(fullArgs).map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`,
   );
 
   const child = spawn("codex", fullArgs, {
@@ -399,6 +492,90 @@ export async function runCodex(args: string[]) {
     console.error(`Error starting Codex: ${err.message}`);
     process.exit(1);
   });
+}
+
+function traceCliStart(
+  event: string,
+  args: string[],
+  originalEnv: NodeJS.ProcessEnv,
+  envGuardAction: string,
+  pair: PairResolution,
+) {
+  try {
+    appendTraceEvent({
+      cwd: process.cwd(),
+      event,
+      pid: process.pid,
+      argv: ["agentbridge", "codex", ...args],
+      env: process.env,
+      data: {
+        originalEnv: pickRelevantEnv(originalEnv),
+        effectiveEnv: pickRelevantEnv(process.env),
+        envGuardAction,
+        pairId: pair.pairId,
+        pairName: pair.name,
+        manual: pair.manual,
+        slot: pair.slot,
+        stateDir: pair.stateDir.dir,
+        ports: pair.ports,
+        build: BUILD_INFO,
+      },
+    });
+  } catch {
+    // Trace logging is diagnostic only.
+  }
+}
+
+function guardNoLiveManagedTui(stateDir: PairResolution["stateDir"]) {
+  const pid = readTuiPid(stateDir);
+  if (!pid) return;
+  if (!isProcessAlive(pid)) {
+    try { unlinkSync(stateDir.tuiPidFile); } catch {}
+    return;
+  }
+  if (!isManagedCodexTuiProcess(pid)) {
+    appendWrapperLog(stateDir.codexWrapperLogFile, `stale tui pid file pointed at unmanaged live pid=${pid}; removing`);
+    try { unlinkSync(stateDir.tuiPidFile); } catch {}
+    return;
+  }
+
+  console.error(`[agentbridge] This pair already has a managed Codex TUI running (pid ${pid}).`);
+  console.error(`[agentbridge] Use that terminal, or stop it with: ${pairScopedCommand("kill")}`);
+  process.exit(1);
+}
+
+function readTuiPid(stateDir: PairResolution["stateDir"]): number | null {
+  try {
+    const raw = readFileSync(stateDir.tuiPidFile, "utf-8").trim();
+    if (!raw) return null;
+    const pid = Number.parseInt(raw, 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isManagedCodexTuiProcess(pid: number): boolean {
+  try {
+    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+    return (
+      cmd.includes("codex") &&
+      cmd.includes("--enable") &&
+      cmd.includes("tui_app_server") &&
+      cmd.includes("--remote")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function proxyHealthUrl(proxyUrl: string): string {
