@@ -59,32 +59,52 @@ E2E uses the bash shape).
 
 **Pass:** all three surfaces agree; percentages match the fixture.
 
-### Test 2 — P1 joint pause: gate closes with reason, both sides informed
+### Test 2 — v2.4 side-aware pause: Codex-side closes the gate, Claude can solo
 
-**Goal:** any side ≥ pauseAt(90) on gateUtil → STOP directive + reply gate.
+**Goal:** Codex gateUtil ≥ pauseAt(90) → `system_budget_pause` + gate closed;
+Claude side stays free for solo work.
 
 1. Start pair in normal phase; confirm round-trip works.
-2. Rewrite codex fixture to gateUtil 93% (5h window), reset_epoch ≈ now+10min.
-3. Within one poll interval (≤60s) Claude receives a `system_budget_*` STOP
-   directive (checkpoint + stop delegating; mentions恢复时刻; does NOT instruct
-   relaying to Codex).
-4. Claude calls `reply` → tool returns error containing 预算暂停 + 预计恢复时刻.
-5. `abg budget` shows `paused（联合暂停）`, paused_by=codex.
+2. Rewrite CODEX fixture to gateUtil 93% (5h window), reset_epoch ≈ now+10min.
+3. Within one poll interval (≤60s) Claude receives `system_budget_pause_*`
+   (checkpoint + may continue solo on independent work + mark the split point).
+4. Claude calls `reply` → error containing 预算暂停 + 预计恢复（以实测为准）.
+5. `abg budget` shows Codex 侧额度耗尽（闸门关闭）, pauseSide=codex.
 6. Codex receives **no** injected turn (its session stays idle — that IS the park).
 
-**Pass:** gate enforced; no standalone injection to Codex; reason includes resume time.
+**Pass:** gate enforced; Claude-side tooling unrestricted; wording is side-aware.
 
-### Test 3 — P1 resume: wake chain daemon → Claude → Codex
+### Test 2b — v2.4 handoff: Claude-side exhaustion keeps the gate OPEN
 
-**Goal:** BOTH sides < resumeBelow(30) → RESUME directive reopens the gate.
+**Goal:** Claude gateUtil ≥ pauseAt(90), Codex healthy → `system_budget_handoff`;
+the baton reply still goes through.
 
-1. From Test 2's paused state, rewrite both fixtures to gateUtil 5%.
-2. Within one poll interval Claude receives the RESUME notice (push mode wakes
-   an idle Claude session — verify the notice arrives without user input).
-3. Claude sends `reply` → succeeds; Codex wakes with the relayed context.
-4. One side <30 but the other still ≥30 → gate stays closed (flip only one fixture first).
+1. From normal phase, rewrite CLAUDE fixture to gateUtil 91% (Codex stays low).
+2. Claude receives `system_budget_handoff_*` (package remaining work into ONE
+   reply: task list, context, artifact locations, acceptance criteria).
+3. Claude sends the handoff `reply` → **succeeds** (gate open); Codex starts its
+   turn and pushes the work forward within that single agentic turn.
+4. `abg budget` shows 接力中（闸门开放）, pauseSide=claude.
+5. Escalation: ALSO raise codex fixture ≥90 → state upgrades to 双侧联合暂停,
+   gate closes, further replies rejected.
 
-**Pass:** resume requires BOTH sides; wake chain works end-to-end in push mode.
+**Pass:** handoff reply not blocked; Codex relays the baton; escalation closes the gate.
+
+### Test 3 — v2.4 resume paths (side-aware)
+
+**Goal:** each activeSides downgrade path emits its own notice.
+
+1. From joint pause (Test 2b step 5), drop CLAUDE fixture to 5% → state
+   downgrades to Codex-only pause (`system_budget_pause` again, gate STILL closed,
+   Claude-solo wording).
+2. Drop CODEX fixture to 5% → `system_budget_resume_*`, gate opens; Claude
+   `reply` succeeds; Codex wakes with the relayed context.
+3. Separately: from a Claude-only handoff, drop CLAUDE to 5% →
+   `system_budget_claude_recovered_*` notice (gate was never closed).
+4. Early-refresh realism: release follows live probes — a weekly refresh that
+   resets windows ahead of the displayed estimate must release on the next poll.
+
+**Pass:** all downgrade paths emit distinct notices; resume follows live probes.
 
 ### Test 4 — P1 daemon restart during pause: re-derivation
 

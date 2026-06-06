@@ -114,7 +114,16 @@ export interface BudgetSnapshot {
   claude: AgentUsage | null;
   codex: AgentUsage | null;
   driftPct: number;
+  /** R4 intervention active (handoff OR pause) — kept for backwards consumers. */
   paused: boolean;
+  /**
+   * v2.4 side-aware semantics (coordinator hysteresis state, NOT instantaneous):
+   * gateClosed is the daemon gate's ONLY authority — true when the Codex side
+   * is exhausted ({codex} or {claude,codex}); false for Claude-only handoff.
+   */
+  gateClosed: boolean;
+  /** Which side(s) are budget-exhausted per the coordinator's activeSides set. */
+  pauseSide: AgentName | "both" | null;
   pauseReason: string | null;
   /** Earliest unix seconds at which resume is plausible (max of gating reset epochs), null when not paused. */
   resumeAfterEpoch: number | null;

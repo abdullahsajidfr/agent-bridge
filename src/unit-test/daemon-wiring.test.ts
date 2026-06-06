@@ -144,7 +144,7 @@ describe("daemon wiring", () => {
         (message) => message.id.startsWith("system_budget_pause_"),
         "system_budget_pause directive",
       );
-      expect(stop.content).toContain("联合暂停");
+      expect(stop.content).toContain("暂停委派");
       expect(stop.content).toContain("checkpoint");
 
       // Gate closed: claude_to_codex is refused with the budget error.
@@ -160,7 +160,7 @@ describe("daemon wiring", () => {
         (m) => m.type === "claude_to_codex_result" && m.requestId === "req-budget-1",
       ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
       expect(rejected.success).toBe(false);
-      expect(rejected.error).toContain("预算联合暂停");
+      expect(rejected.error).toContain("预算暂停（闸门关闭）");
       expect(rejected.error).toContain("checkpoint");
 
       // DaemonStatus.budget reflects the pause.
@@ -178,7 +178,7 @@ describe("daemon wiring", () => {
         50,
       );
       const resume = harness.messages.find((message) => message.id.startsWith("system_budget_resume_"))!;
-      expect(resume.content).toContain("联合暂停解除");
+      expect(resume.content).toContain("Codex 侧预算闸门解除");
 
       // Gate open again: the same injection now succeeds.
       harness.sendClaudeToCodex("req-budget-2", "hello after resume");
@@ -250,7 +250,103 @@ describe("daemon wiring", () => {
         (message) => message.id.startsWith("system_budget_pause_"),
         "buffered system_budget_pause after attach",
       );
-      expect(stop.content).toContain("联合暂停");
+      expect(stop.content).toContain("暂停委派");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("claude-side handoff keeps the gate OPEN; codex escalation closes it (v2.4)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-handoff-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 93); // Claude-only trigger → handoff, gate stays open
+    writeUsage("codex", 10);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgethand",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Handoff directive (NOT the pause id) arrives on the first poll.
+      const handoff = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_handoff_"),
+        "system_budget_handoff directive",
+      );
+      expect(handoff.content).toContain("交接");
+
+      // The baton reply goes THROUGH — gate is open for a Claude-only trigger.
+      harness.sendClaudeToCodex("req-handoff-1", "baton: remaining tasks + acceptance criteria");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-1",
+          ),
+        "claude_to_codex_result for req-handoff-1",
+      );
+      const baton = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-1",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(baton.success).toBe(true);
+
+      // Snapshot: intervention active, gate open, side=claude.
+      const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+      const status = (await healthz.json()) as DaemonStatus;
+      expect(status.budget?.paused).toBe(true);
+      expect(status.budget?.gateClosed).toBe(false);
+      expect(status.budget?.pauseSide).toBe("claude");
+
+      // Escalation: codex also trips → upgrade to joint pause, gate closes.
+      writeUsage("codex", 95);
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const s = (await res.json()) as DaemonStatus;
+          return s.budget?.gateClosed === true && s.budget?.pauseSide === "both";
+        } catch {
+          return false;
+        }
+      }, "escalation to joint pause (gateClosed + both)", 400, 50);
+
+      harness.sendClaudeToCodex("req-handoff-2", "should be gated now");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-2",
+          ),
+        "claude_to_codex_result for req-handoff-2",
+      );
+      const gated = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-2",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(gated.success).toBe(false);
+      expect(gated.error).toContain("闸门关闭");
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }

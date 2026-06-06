@@ -99,9 +99,12 @@ describe("BudgetCoordinator", () => {
       phase: "normal",
       updatedAt: NOW,
       paused: false,
+      gateClosed: false,
+      pauseSide: null,
       codexTier: "full",
     });
     expect(coordinator.isPaused()).toBe(false);
+    expect(coordinator.isGateClosed()).toBe(false);
     expect(coordinator.getCodexTurnOverrides()).toBeNull();
     expect(emitted).toEqual([]);
   });
@@ -142,20 +145,22 @@ describe("BudgetCoordinator", () => {
     expect(emitted.filter((event) => event.id.startsWith("system_budget_balance"))).toHaveLength(2);
   });
 
-  test("emits pause and resume on pause lifecycle edges", async () => {
+  test("emits Codex-side pause and resume on gate lifecycle edges", async () => {
     const source = new FakeSource([
       { claude: usage(), codex: usage() },
-      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
-      { claude: usage({ gateUtil: 50, warnUtil: 50, remaining: 50 }), codex: usage() },
-      { claude: usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }), codex: usage() },
+      { claude: usage(), codex: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }) },
+      { claude: usage(), codex: usage({ gateUtil: 50, warnUtil: 50, remaining: 50 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }) },
     ]);
     const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
 
     await coordinator.start();
     await waitFor(() => emitted.some((event) => event.id.startsWith("system_budget_pause")));
     expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
     await waitFor(() => source.calls >= 3);
     expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
     expect(emitted.some((event) => event.id.startsWith("system_budget_resume"))).toBe(false);
     await waitFor(() => emitted.some((event) => event.id.startsWith("system_budget_resume")));
     coordinator.stop();
@@ -163,15 +168,52 @@ describe("BudgetCoordinator", () => {
     expect(pauseChanges).toEqual([true, false]);
     expect(emitted.map((event) => event.id.split("_").slice(0, 3).join("_"))).toContain("system_budget_pause");
     const resume = emitted.find((event) => event.id.startsWith("system_budget_resume"));
-    expect(resume?.content).toContain("联合暂停解除");
+    expect(resume?.content).toContain("Codex 侧预算闸门解除");
     expect(resume?.content).toContain("reply");
     expect(resume?.content).toContain("唤醒 Codex");
-    expect(coordinator.getSnapshot()?.paused).toBe(false);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
+  });
+
+  test("Claude-side handoff keeps intervention visible but leaves the gate open", async () => {
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: false, pauseSide: "claude" });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].id).toStartWith("system_budget_handoff");
+    expect(emitted[0].content).toContain("立即交接");
+    expect(pauseChanges).toEqual([true]);
+  });
+
+  test("joint pause closes the gate and records both sides", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: true, pauseSide: "both" });
+    expect(emitted[0].id).toStartWith("system_budget_pause");
+    expect(emitted[0].content).toContain("联合暂停");
   });
 
   test("re-emits a pause after coordinator reconstruction", async () => {
     const firstSource = new FakeSource([
-      { claude: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }), codex: usage() },
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
     ]);
     const first = makeCoordinator(firstSource);
 
@@ -179,7 +221,7 @@ describe("BudgetCoordinator", () => {
     first.coordinator.stop();
 
     const secondSource = new FakeSource([
-      { claude: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }), codex: usage() },
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
     ]);
     const second = makeCoordinator(secondSource);
 
@@ -204,9 +246,28 @@ describe("BudgetCoordinator", () => {
     coordinator.stop();
 
     expect(coordinator.isPaused()).toBe(true);
-    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, claude: null, codex: null });
-    expect(emitted.filter((event) => event.id.startsWith("system_budget_pause"))).toHaveLength(1);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: false, pauseSide: "claude", claude: null, codex: null });
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_handoff"))).toHaveLength(1);
     expect(emitted.some((event) => event.id.startsWith("system_budget_resume"))).toBe(false);
+    expect(pauseChanges).toEqual([true]);
+  });
+
+  test("keeps Codex-side gate closed when probes disappear during pause", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
+      { claude: null, codex: null },
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: true, pauseSide: "codex", claude: null, codex: null });
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_pause"))).toHaveLength(1);
     expect(pauseChanges).toEqual([true]);
   });
 
@@ -242,9 +303,10 @@ describe("BudgetCoordinator", () => {
     coordinator.stop();
 
     expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(false);
     expect(coordinator.getSnapshot()?.resumeAfterEpoch).toBe(NOW + 900);
     expect(pauseChanges).toEqual([true]);
-    expect(emitted[0].id).toStartWith("system_budget_pause");
+    expect(emitted[0].id).toStartWith("system_budget_handoff");
     expect(emitted[0].content).toContain("限流");
   });
 
@@ -259,9 +321,89 @@ describe("BudgetCoordinator", () => {
       phase: "normal",
       claude: null,
       paused: false,
+      gateClosed: false,
+      pauseSide: null,
     });
     expect(emitted).toEqual([]);
     expect(pauseChanges).toEqual([]);
+  });
+
+  test("transitions Claude handoff to joint pause and down to Codex pause", async () => {
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_handoff",
+      "system_budget_pause",
+      "system_budget_pause",
+    ]);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: true, pauseSide: "codex" });
+  });
+
+  test("downgrades joint pause to Claude handoff when Codex recovers first", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_handoff",
+    ]);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: false, pauseSide: "claude" });
+  });
+
+  test("emits distinct recovery events for Codex pause and Claude handoff", async () => {
+    const codexSource = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
+      { claude: usage(), codex: usage() },
+    ]);
+    const codex = makeCoordinator(codexSource);
+
+    await codex.coordinator.start();
+    await waitFor(() => codexSource.calls >= 2);
+    codex.coordinator.stop();
+
+    expect(codex.emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_resume",
+    ]);
+    expect(codex.coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
+
+    const claudeSource = new FakeSource([
+      { claude: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }), codex: usage() },
+      { claude: usage(), codex: usage() },
+    ]);
+    const claude = makeCoordinator(claudeSource);
+
+    await claude.coordinator.start();
+    await waitFor(() => claudeSource.calls >= 2);
+    claude.coordinator.stop();
+
+    expect(claude.emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_handoff",
+      "system_budget_claude_recovered",
+    ]);
+    expect(claude.coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
   });
 
   test("queues pending Codex overrides, clears after delivery, and does not requeue same tier", async () => {

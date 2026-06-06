@@ -37,7 +37,8 @@ const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
   normal: "normal（正常）",
   balance: "balance（需均衡）",
   parallel: "parallel（建议并行提速）",
-  paused: "paused（联合暂停）",
+  // Side-neutral: the detail line below distinguishes handoff / codex-only / joint.
+  paused: "paused（预算干预中）",
 };
 
 /** Render a budget snapshot as readable Chinese text. */
@@ -59,8 +60,19 @@ export function renderBudgetSnapshot(snapshot: BudgetSnapshot): string {
   }
 
   if (snapshot.paused) {
-    const resume = snapshot.resumeAfterEpoch ? `；预计恢复不早于 ${formatEpoch(snapshot.resumeAfterEpoch)}` : "";
-    lines.push(`暂停：是 — ${snapshot.pauseReason ?? "额度接近耗尽"}${resume}`);
+    // Estimate only: an early weekly refresh resets both windows ahead of
+    // schedule, so release always follows live probes, not this timestamp.
+    const resume = snapshot.resumeAfterEpoch
+      ? `；预计恢复 ${formatEpoch(snapshot.resumeAfterEpoch)}（以实测为准；提前刷新会更早解除）`
+      : "";
+    const reason = snapshot.pauseReason ?? "额度接近耗尽";
+    if (snapshot.pauseSide === "claude" && !snapshot.gateClosed) {
+      lines.push(`接力中：Claude 侧额度耗尽，已交接 Codex 继续推进（闸门开放） — ${reason}${resume}`);
+    } else if (snapshot.pauseSide === "codex") {
+      lines.push(`暂停：Codex 侧额度耗尽（闸门关闭，Claude 可 solo 推进独立部分） — ${reason}${resume}`);
+    } else {
+      lines.push(`暂停：双侧联合暂停（闸门关闭） — ${reason}${resume}`);
+    }
   } else {
     lines.push("暂停：否");
   }

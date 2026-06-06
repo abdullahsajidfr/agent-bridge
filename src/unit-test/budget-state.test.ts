@@ -49,7 +49,7 @@ describe("computeBudgetState", () => {
     expect(state.pause.active).toBe(false);
   });
 
-  test("pauses when either side gateUtil reaches pauseAt", () => {
+  test("renders Claude-side handoff directive when only Claude reaches pauseAt", () => {
     const state = computeBudgetState(
       usage({ gateUtil: 91, warnUtil: 91, remaining: 9, fiveHour: { util: 91, resetEpoch: NOW + 1800 } }),
       usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }),
@@ -60,8 +60,33 @@ describe("computeBudgetState", () => {
     expect(state.phase).toBe("paused");
     expect(state.pause).toMatchObject({ active: true, side: "claude", resumeBelow: 30 });
     expect(state.pause.resetEpochs.claude).toBe(NOW + 1800);
-    expect(state.directiveToClaude).toContain("联合暂停");
+    expect(state.directiveToClaude).toContain("立即交接");
+    expect(state.directiveToClaude).toContain("剩余任务清单");
+    expect(state.directiveToClaude).toContain("上下文");
+    expect(state.directiveToClaude).toContain("验收标准");
+    expect(state.directiveToClaude).toContain("单 turn");
+    expect(state.directiveToClaude).toContain("checkpoint");
+    expect(state.directiveToClaude).toContain("不要期待 Claude 回复");
+    expect(state.directiveToClaude).not.toContain("进入联合暂停");
     expect(state.directiveToClaude).toContain("账号级");
+  });
+
+  test("renders Codex-side pause directive when only Codex reaches pauseAt", () => {
+    const state = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }),
+      usage({ gateUtil: 91, warnUtil: 91, remaining: 9, fiveHour: { util: 91, resetEpoch: NOW + 1800 } }),
+      CONFIG,
+      NOW,
+    );
+
+    expect(state.phase).toBe("paused");
+    expect(state.pause).toMatchObject({ active: true, side: "codex" });
+    expect(state.directiveToClaude).toContain("Codex");
+    expect(state.directiveToClaude).toContain("暂停委派");
+    expect(state.directiveToClaude).toContain("solo");
+    expect(state.directiveToClaude).toContain("分工断点");
+    expect(state.directiveToClaude).toContain("以实测为准");
+    expect(state.directiveToClaude).toContain("提前刷新会更早解除");
   });
 
   test("does not pause when warnUtil is high but gateUtil is below pauseAt", () => {
@@ -122,8 +147,8 @@ describe("computeBudgetState", () => {
     expect(state.pause.resumeAfterEpoch).toBe(NOW + 600);
     const codexResume = new Date((NOW + 600) * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
     const claudeReset = new Date((NOW + 7200) * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-    expect(state.directiveToClaude).toContain(`预计恢复不早于 ${codexResume}`);
-    expect(state.directiveToClaude).not.toContain(`预计恢复不早于 ${claudeReset}`);
+    expect(state.directiveToClaude).toContain(`预计恢复时间（以实测为准；提前刷新会更早解除）：${codexResume}`);
+    expect(state.directiveToClaude).not.toContain(`预计恢复时间（以实测为准；提前刷新会更早解除）：${claudeReset}`);
   });
 
   test("balances toward the lighter side using warnUtil drift", () => {

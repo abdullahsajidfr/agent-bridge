@@ -143,7 +143,12 @@ function ensureBudgetCoordinatorStarted() {
         queueMicrotask(() => broadcastStatus());
       },
       onPauseChange: (paused) => {
-        log(`Budget pause gate ${paused ? "CLOSED" : "OPEN"}`);
+        // v2.4: paused = R4 intervention active (handoff OR pause); the reply
+        // gate itself is side-aware and may stay open during a Claude handoff.
+        log(
+          `Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` +
+          `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`,
+        );
         queueMicrotask(() => broadcastStatus());
       },
       log,
@@ -167,16 +172,22 @@ function stopBudgetCoordinator() {
 }
 
 function budgetPauseGateError(): string {
+  // The gate only closes when the CODEX side is exhausted (pauseSide codex/both,
+  // v2.4 side-aware semantics) — the error wording reflects that, and the
+  // resume estimate is advisory only (an early weekly refresh releases sooner).
   const snapshot = budgetCoordinator?.getSnapshot() ?? null;
-  const reason = snapshot?.pauseReason ?? "额度接近耗尽";
+  const reason = snapshot?.pauseReason ?? "Codex 侧额度接近耗尽";
   const resumeAt = snapshot?.resumeAfterEpoch
     ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
     : null;
+  const sideHint = snapshot?.pauseSide === "both"
+    ? "双侧额度均已耗尽，请写 checkpoint 等待刷新"
+    : "你可继续 solo 推进可独立部分，并写 checkpoint 标注分工断点";
   return (
-    `预算联合暂停中，已拒绝转发：${reason}。` +
-    `双方 gateUtil 均低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开` +
-    (resumeAt ? `（预计恢复不早于 ${resumeAt}）` : "") +
-    "。收到 RESUME 通知前请勿重试；请写 checkpoint 并停止委派。"
+    `预算暂停（闸门关闭），已拒绝转发：${reason}。` +
+    `Codex 侧 gateUtil 低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开` +
+    (resumeAt ? `（预计恢复 ${resumeAt}，以实测为准；提前刷新会更早解除）` : "") +
+    `。收到 RESUME 通知前请勿重试向 Codex 发送 reply；${sideHint}。`
   );
 }
 
@@ -489,10 +500,12 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      // Budget pause gate (plan v2.3 R4): while jointly paused, refuse to start
-      // Codex turns at all — not sending a turn IS the park. Same shape as the
-      // busy-guard rejection below.
-      if (budgetCoordinator?.isPaused()) {
+      // Budget pause gate (plan v2.4 side-aware R4): the gate protects the
+      // TARGET side's quota, so it closes only when the Codex side is exhausted
+      // (gateClosed = pauseSide codex/both). A Claude-only handoff keeps the
+      // gate OPEN so the baton reply can reach Codex. Same rejection shape as
+      // the busy-guard below.
+      if (budgetCoordinator?.isGateClosed()) {
         const reason = budgetPauseGateError();
         log(`Injection rejected by budget pause gate`);
         sendProtocolMessage(ws, {

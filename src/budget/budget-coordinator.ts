@@ -1,4 +1,4 @@
-import { computeBudgetState } from "./budget-state";
+import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
 import type {
   AgentName,
   AgentUsage,
@@ -11,6 +11,7 @@ import type {
 import type { QuotaSource } from "./quota-source";
 
 type QuotaSourceLike = Pick<QuotaSource, "fetchBoth">;
+type PauseSide = BudgetSnapshot["pauseSide"];
 
 export interface BudgetCoordinatorOptions {
   source: QuotaSourceLike;
@@ -58,7 +59,7 @@ export class BudgetCoordinator {
 
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
-  private paused = false;
+  private readonly activeSides = new Set<AgentName>();
   private lastDirectiveFingerprint: string | null = null;
   private latestSnapshot: BudgetSnapshot | null = null;
   private pauseReason: string | null = null;
@@ -94,7 +95,11 @@ export class BudgetCoordinator {
   }
 
   isPaused(): boolean {
-    return this.paused;
+    return this.activeSides.size > 0;
+  }
+
+  isGateClosed(): boolean {
+    return this.activeSides.has("codex");
   }
 
   getSnapshot(): BudgetSnapshot | null {
@@ -137,7 +142,7 @@ export class BudgetCoordinator {
     }
 
     if (!usage) {
-      if (!this.paused) this.latestSnapshot = null;
+      if (!this.isPaused()) this.latestSnapshot = null;
       return;
     }
 
@@ -152,33 +157,38 @@ export class BudgetCoordinator {
   }
 
   private applyState(state: BudgetState): void {
-    if (state.pause.active) {
-      this.pauseReason = state.pause.reason;
-      this.pauseResumeAfterEpoch = state.pause.resumeAfterEpoch;
-      const fingerprint = this.directiveFingerprint(state);
-      if (!this.paused) {
-        this.paused = true;
+    const previousSide = this.pauseSide();
+    this.updateActiveSides(state);
+    const currentSide = this.pauseSide();
+
+    if (currentSide) {
+      this.pauseReason = this.interventionReason(state);
+      const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
+      this.pauseResumeAfterEpoch = previousSide === currentSide
+        ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch
+        : nextResumeAfterEpoch;
+      const fingerprint = previousSide === currentSide && this.activeSideUsageMissing(state) && this.lastDirectiveFingerprint
+        ? this.lastDirectiveFingerprint
+        : this.directiveFingerprint(state, currentSide);
+      if (!previousSide) {
         this.onPauseChange(true);
-        this.emitDirective("system_budget_pause", state.directiveToClaude ?? this.pauseReason ?? "预算协调进入联合暂停。");
-      } else if (fingerprint !== this.lastDirectiveFingerprint) {
-        this.emitDirective("system_budget_pause", state.directiveToClaude ?? this.pauseReason ?? "预算协调进入联合暂停。");
+      }
+      if (!previousSide || previousSide !== currentSide || fingerprint !== this.lastDirectiveFingerprint) {
+        this.emitDirective(
+          this.interventionPrefix(currentSide),
+          this.interventionDirective(state, currentSide),
+        );
       }
       this.lastDirectiveFingerprint = fingerprint;
       return;
     }
 
-    if (this.paused) {
-      if (!this.canResume(state)) {
-        this.pauseResumeAfterEpoch = this.resumeAfterEpoch(state) ?? this.pauseResumeAfterEpoch;
-        return;
-      }
-
-      this.paused = false;
+    if (previousSide) {
       this.pauseReason = null;
       this.pauseResumeAfterEpoch = null;
       this.lastDirectiveFingerprint = null;
       this.onPauseChange(false);
-      this.emitDirective("system_budget_resume", this.resumeDirective(state));
+      this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
       return;
     }
 
@@ -195,9 +205,21 @@ export class BudgetCoordinator {
     }
   }
 
-  private canResume(state: BudgetState): boolean {
-    // Joint pause exits only when BOTH agents have fresh visible usage below resumeBelow.
-    return this.canAgentResume(state.perAgent.claude, state.now) && this.canAgentResume(state.perAgent.codex, state.now);
+  private updateActiveSides(state: BudgetState): void {
+    for (const agent of ["claude", "codex"] as const) {
+      const usage = state.perAgent[agent];
+      if (this.shouldEnter(usage, state.now)) {
+        this.activeSides.add(agent);
+      } else if (this.activeSides.has(agent) && this.canAgentResume(usage, state.now)) {
+        this.activeSides.delete(agent);
+      }
+    }
+  }
+
+  private shouldEnter(usage: AgentUsage | null, now: number): boolean {
+    if (!usage) return false;
+    if (usage.rateLimitedUntil > now) return true;
+    return usage.gateUtil >= this.config.pauseAt;
   }
 
   private canAgentResume(usage: AgentUsage | null, now: number): boolean {
@@ -207,10 +229,10 @@ export class BudgetCoordinator {
   }
 
   private resumeAfterEpoch(state: BudgetState): number | null {
-    const epochs = [
-      this.resumeBlockingEpoch(state.perAgent.claude, state.now),
-      this.resumeBlockingEpoch(state.perAgent.codex, state.now),
-    ].filter((epoch) => epoch > 0);
+    const epochs = (["claude", "codex"] as const)
+      .filter((agent) => this.activeSides.has(agent))
+      .map((agent) => this.resumeBlockingEpoch(state.perAgent[agent], state.now))
+      .filter((epoch) => epoch > 0);
     if (epochs.length === 0) return null;
     return Math.max(...epochs);
   }
@@ -258,12 +280,18 @@ export class BudgetCoordinator {
     this.pendingOverrides = { ...overrides };
   }
 
-  private directiveFingerprint(state: BudgetState): string {
-    const side = state.phase === "balance"
+  private directiveFingerprint(state: BudgetState, activeSide?: Exclude<PauseSide, null>): string {
+    const side = activeSide ?? (state.phase === "balance"
       ? state.drift.lighter ?? "none"
-      : state.pause.side ?? "none";
+      : state.pause.side ?? "none");
     let reset = 0;
-    if (state.phase === "balance" && state.drift.lighter) {
+    if (activeSide === "claude") {
+      reset = state.pause.resetEpochs.claude;
+    } else if (activeSide === "codex") {
+      reset = state.pause.resetEpochs.codex;
+    } else if (activeSide === "both") {
+      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    } else if (state.phase === "balance" && state.drift.lighter) {
       reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
     } else if (side === "claude") {
       reset = state.pause.resetEpochs.claude;
@@ -274,7 +302,7 @@ export class BudgetCoordinator {
     }
 
     return [
-      state.phase,
+      activeSide ? "paused" : state.phase,
       state.drift.heavier ?? "none",
       side,
       reset,
@@ -285,7 +313,77 @@ export class BudgetCoordinator {
     this.emit(`${prefix}_${this.sequence++}`, content);
   }
 
-  private resumeDirective(state: BudgetState): string {
+  private pauseSide(): PauseSide {
+    const claude = this.activeSides.has("claude");
+    const codex = this.activeSides.has("codex");
+    if (claude && codex) return "both";
+    if (claude) return "claude";
+    if (codex) return "codex";
+    return null;
+  }
+
+  private interventionPrefix(side: Exclude<PauseSide, null>): string {
+    return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
+  }
+
+  private recoveryPrefix(previousSide: Exclude<PauseSide, null>): string {
+    return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  }
+
+  private interventionDirective(state: BudgetState, side: Exclude<PauseSide, null>): string {
+    return renderBudgetInterventionDirective(
+      state.perAgent.claude,
+      state.perAgent.codex,
+      side,
+      this.pauseReason ?? "预算接近耗尽",
+      this.pauseResumeAfterEpoch,
+      this.config,
+    );
+  }
+
+  private interventionReason(state: BudgetState): string {
+    return (["claude", "codex"] as const)
+      .filter((agent) => this.activeSides.has(agent))
+      .map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now))
+      .join("；");
+  }
+
+  private activeSideUsageMissing(state: BudgetState): boolean {
+    return (["claude", "codex"] as const).some((agent) =>
+      this.activeSides.has(agent) && state.perAgent[agent] === null
+    );
+  }
+
+  private activeSideReason(agent: AgentName, usage: AgentUsage | null, now: number): string {
+    if (!usage) return `${AGENT_LABEL[agent]} 探测暂时不可用，保持上一轮预算干预`;
+    if (usage.rateLimitedUntil > now) {
+      return `${AGENT_LABEL[agent]} 探针被限流至 ${this.formatEpoch(usage.rateLimitedUntil)}`;
+    }
+    if (usage.gateUtil >= this.config.pauseAt) {
+      return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(this.config.pauseAt)}`;
+    }
+    return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} 尚未低于 resumeBelow ${pct(this.config.resumeBelow)}`;
+  }
+
+  private recoveryDirective(state: BudgetState, previousSide: Exclude<PauseSide, null>): string {
+    if (previousSide === "claude") {
+      return [
+        "【预算协调 · 账号级】Claude 侧预算已恢复。",
+        `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
+        `Claude gateUtil 已低于 ${pct(this.config.resumeBelow)}，且没有有效 rate_limit。`,
+        "Claude 可恢复 orchestrator 角色；后续分配前请重新查询实时额度，不要依赖旧数字。",
+      ].join("\n");
+    }
+
+    if (previousSide === "codex") {
+      return [
+        "【预算协调 · 账号级】Codex 侧预算闸门解除。",
+        `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
+        `闸门已放开：Codex gateUtil 低于 ${pct(this.config.resumeBelow)}，且没有有效 rate_limit。`,
+        "建议 Claude 用 reply 带上当前目标、checkpoint 和下一步，唤醒 Codex 接续执行。",
+      ].join("\n");
+    }
+
     return [
       "【预算协调 · 账号级】联合暂停解除。",
       `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
@@ -294,8 +392,12 @@ export class BudgetCoordinator {
     ].join("\n");
   }
 
+  private formatEpoch(epoch: number): string {
+    return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  }
+
   private toSnapshot(state: BudgetState): BudgetSnapshot {
-    const paused = this.paused;
+    const paused = this.isPaused();
     return {
       phase: paused ? "paused" : state.phase,
       updatedAt: state.now,
@@ -303,8 +405,10 @@ export class BudgetCoordinator {
       codex: state.perAgent.codex,
       driftPct: state.drift.pct,
       paused,
+      gateClosed: this.isGateClosed(),
+      pauseSide: this.pauseSide(),
       pauseReason: paused ? this.pauseReason ?? state.pause.reason : null,
-      resumeAfterEpoch: paused ? state.pause.resumeAfterEpoch ?? this.pauseResumeAfterEpoch : null,
+      resumeAfterEpoch: paused ? this.pauseResumeAfterEpoch ?? state.pause.resumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,

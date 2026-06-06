@@ -25,6 +25,8 @@ function snapshot(overrides: Partial<BudgetSnapshot> = {}): BudgetSnapshot {
     codex: usage({ gateUtil: 10, warnUtil: 14, fiveHour: { util: 10, resetEpoch: 1_780_699_485 } }),
     driftPct: 31,
     paused: false,
+    gateClosed: false,
+    pauseSide: null,
     pauseReason: null,
     resumeAfterEpoch: null,
     parallelRecommended: false,
@@ -53,18 +55,54 @@ describe("renderBudgetSnapshot", () => {
     expect(reversed).toContain("Codex 比 Claude 高 12 个百分点");
   });
 
-  test("renders paused state with reason and resume epoch", () => {
+  test("renders codex-side pause with gate-closed wording and live-probe caveat", () => {
     const text = renderBudgetSnapshot(
       snapshot({
         phase: "paused",
         paused: true,
+        gateClosed: true,
+        pauseSide: "codex",
         pauseReason: "Codex 5h 窗口已达 92%",
         resumeAfterEpoch: 1_780_750_000,
       }),
     );
-    expect(text).toContain("paused（联合暂停）");
-    expect(text).toContain("暂停：是 — Codex 5h 窗口已达 92%");
-    expect(text).toContain("预计恢复不早于");
+    expect(text).toContain("Codex 侧额度耗尽");
+    expect(text).toContain("闸门关闭");
+    expect(text).toContain("Codex 5h 窗口已达 92%");
+    // v2.4: early weekly refresh may release sooner — estimate is advisory.
+    expect(text).toContain("以实测为准");
+    expect(text).not.toContain("不早于");
+    // Side-aware: the phase label must NOT claim a joint pause for one side.
+    expect(text).not.toContain("联合暂停");
+  });
+
+  test("renders claude-side handoff with gate OPEN wording", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({
+        phase: "paused",
+        paused: true,
+        gateClosed: false,
+        pauseSide: "claude",
+        pauseReason: "Claude 5h 窗口已达 91%",
+      }),
+    );
+    expect(text).toContain("接力中");
+    expect(text).toContain("闸门开放");
+    expect(text).not.toContain("闸门关闭");
+    expect(text).not.toContain("联合暂停");
+  });
+
+  test("renders joint pause for both sides", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({
+        phase: "paused",
+        paused: true,
+        gateClosed: true,
+        pauseSide: "both",
+        pauseReason: "双侧均超阈值",
+      }),
+    );
+    expect(text).toContain("双侧联合暂停");
   });
 
   test("renders unknown side when one agent's probe is unavailable", () => {

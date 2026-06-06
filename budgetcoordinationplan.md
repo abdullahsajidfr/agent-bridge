@@ -1,6 +1,6 @@
-# AgentBridge × AgentQuotaGuard 集成：预算感知的双 Agent 协调层（v2.2 · 终版）
+# AgentBridge × AgentQuotaGuard 集成：预算感知的双 Agent 协调层（v2.4）
 
-> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1 = 交叉 review 第 1 轮修订（Codex 3 REAL 全采纳 + Claude 侧 2 REAL，1 条驳回有证据）。**v2.2 = 第 2 轮终版**——第 2 轮 Codex 复核 **0 REAL**，本版折入其 3 条 RECOMMEND（rate-limit 结果不得丢 null / config 边界保护 / stop() timer 测试）与 SUSPECT 措辞收紧（transport-accepted ≠ applied），并锁定分支基线。**方案已过双方共识门，进入实施。**
+> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1/v2.2 = 交叉 review 两轮修订（0 REAL 终版，进入实施）。v2.3 = P0 实施期实证修订（探针 per-agent 回退链）。**v2.4 = P0-P4 落地后的用户需求演进：R4 暂停语义按触发侧分级（接力模式）**——见「R4 分侧语义（v2.4）」节；其余照旧。
 >
 > **Round-1 修订摘要**：① R4 进入/解除统一用 `gateUtil`（resettable hard winner）② probe 双形状归一化（bash `hard_util` / node 无此字段）③ capability probe 措辞降级（turn/started 不含 model）④ probe 解析序收紧 ⑤ 新增 `pauseAt=90`（先于 per-agent 硬线 92）⑥ **取消 park 转达**（消除闸门时序洞 + 省一轮 Codex 额度）⑦ R4 自动唤醒声明依赖 push 模式 ⑧ `rate_limited_until > now` ⑨ start() 立即首轮 poll ⑩ balance/parallel 并发合并文案 ⑪ `budget` 进 PAIR_AWARE_COMMANDS ⑫ 无 attached Claude 的 paused 可见性验收 ⑬ 重启重推导（容忍单次重复 STOP）。
 
@@ -59,8 +59,24 @@ flowchart TD
 
 - **`gateUtil(agent)` = probe 的 `util`（resettable hard winner）** —— R4 暂停/解除**唯一**门控指标。非 resettable 桶不参与门控（等不来刷新，由 guard 单边 hook 兜底）。
 - **`warnUtil(agent)` = probe 的 `warn_util`（全桶 max）** —— 仅用于 R1/R3 parity 展示与均衡决策：`drift = warnUtil(claude) − warnUtil(codex)`。
-- **暂停进入**：任一侧 `gateUtil ≥ pauseAt(90)` **或** `rate_limited_until > now`。
-- **暂停解除**：**双方** `gateUtil < resumeBelow(30)` **且** 双方 `rate_limited_until ≤ now`；唤醒轮询在各自 `reset_epoch` 过点时强制重探（绕过缓存 TTL）。
+- ~~**暂停进入**：任一侧 `gateUtil ≥ pauseAt(90)` 或 `rate_limited_until > now`。~~ ~~**暂停解除**：双方 `gateUtil < resumeBelow(30)`。~~ **【v2.4 改为分侧语义，见下节】**
+
+### R4 分侧语义（v2.4 · 接力模式 / handoff）
+
+**核心修正**：`claude_to_codex` 闸门烧的是**目标侧（Codex）**的额度（每条消息起一个 Codex turn）——闸门只应保护 Codex；Claude 自身由它的 quota-guard 92 硬线保护，bridge 拦 Claude 的委派反而阻止了「把活转移到有额度一侧」的最优策略。原「任一侧触发双停」忠实于用户最初表述，但用户在 P0-P4 落地后明确改为接力语义。
+
+| 触发侧（gateUtil ≥ pauseAt 或 rate-limited） | 闸门 gateClosed | 指令 | 解除条件 |
+|---|---|---|---|
+| **仅 Codex** | **true** | Claude：写 checkpoint，**可 solo 推进可独立部分**（不再委派），标注分工断点 | Codex 侧 `gateUtil < resumeBelow` 且无限流 → RESUME、闸门开 |
+| **仅 Claude** | **false（不关！）** | Claude：**立即交接**——把剩余任务清单/上下文/产出位置/验收标准打包成一条 reply 发给 Codex（接力棒），随后停手（自身 guard 92 将拦截）；交接文案要求 Codex 单 turn 尽量完成、尾巴写 checkpoint、暂停期不要期待 Claude 回复 | Claude 侧恢复（< resumeBelow）→ 发「Claude 已恢复」通知，Claude 自然回归 orchestrator |
+| **双侧** | **true** | 联合暂停（v2.2 原行为）：双方 checkpoint、等待刷新 | **双方** < resumeBelow 且无限流 → RESUME |
+
+- **状态机（v2.4.1 · Codex 共识修正 REAL-2）**：coordinator 维护 `activeSides ⊆ {claude, codex}` 显式集合——每轮把 `gateUtil ≥ pauseAt 或 rate_limited_until > now` 的侧加入；已 active 的侧仅在 `usage 非 null 且 gateUtil < resumeBelow 且限流过期` 时移除（探针 null 保持 active，延续 P1 保守语义）。状态映射：`{claude}`=handoff（gate 开）/ `{codex}`=Codex 暂停（gate 关）/ `{claude,codex}`=联合暂停（gate 关）/ `∅`=normal。升降级路径显式定义：both→codex（Claude 恢复：仍关 gate，发 Codex-only 暂停+Claude 可 solo 指令）、both→claude（Codex 恢复：开 gate，发 handoff 指令）、codex→∅（RESUME）、claude→∅（Claude 已恢复通知）、claude→both（升级双停关 gate）。
+- **快照语义（v2.4.1 · REAL-1）**：`BudgetSnapshot.paused` 保留原义（R4 干预激活中，兼容旧消费者）；**新增** `gateClosed: boolean`（daemon 闸门唯一依据）+ `pauseSide: "claude"|"codex"|"both"|null`；daemon 由 `isPaused()` 改用 `isGateClosed()`；渲染按 pauseSide+gateClosed 展示「Claude 接力中 / Codex 暂停 / 双侧暂停」。
+- **事件 id（v2.4.1 · RECOMMEND）**：接力用独立 `system_budget_handoff_*` 与「Claude 已恢复」通知 id，不复用联合暂停文案，防 Claude 误判 reply 会被拒。
+- **【v2.4.1 补充 · 用户需求】互知与实时性**：①协议文本明确双方互查能力——Claude 用 `get_budget`（本就含双方）、Codex 用其 quota-guard MCP `check_budget(agent=claude|codex)`，鼓励决策前互查、主动协商分配，总目标=「任务尽量不停 + 充分用满订阅额度」；②**实时查询硬规则**：周额度可能未用完即提前刷新（且会连带重置 5h 与周窗口），额度数字一律以最新探测为准——协议文本明令「每次分配决策前重新查询，禁止依赖对话记忆里的旧数字」（coordinator 本身每轮实测重算，架构天然满足）；③「预计恢复不早于」措辞改为「预计恢复时间（以实测为准；提前刷新会更早解除）」。
+- **已知 v1 限制**：Claude 接力暂停期间，Codex 发回的 [STATUS] 仍会推送唤醒 Claude（它没额度干活但会被吵醒）——guard 的 prompt 注入会让它收敛；「暂停期推送抑制」列为后续优化。Codex 单 turn 干不完的尾巴依赖 checkpoint + Claude 恢复（或 P5 watchdog）。
+- 受影响实现：`types.ts`（gateClosed/pauseSide 契约）、`budget-state.ts`（分侧指令文案 ×3 + handoff 文案）、`budget-coordinator.ts`（activeSides 状态机 + 分侧事件）、`daemon.ts`（isGateClosed）、`render.ts`（三态展示 + 措辞）、协议文本（接力 + 互查 + 实时查询）、单测 + wiring 测试三场景 + 升降级路径、E2E plan。
 - **阈值分层设计**：`pauseAt=90` **刻意低于** guard 单边硬线 92 —— bridge 协调暂停先行（留 2% 的收尾预算），guard 92 硬线作为逃逸 backstop；T1/T2 提醒仍归 guard。
 - 决策优先级：`paused` → `balance`（|drift| > syncDriftPct）→ `parallel`（双方剩余 > minRemainingPct 且最近 5h 桶距结算 < timeWindowSec）→ `normal`。**balance 与 parallel 同时成立时合并为一条指令**（「lighter 一侧多承担并行子任务」），避免 R2 被优先级吞掉。
 

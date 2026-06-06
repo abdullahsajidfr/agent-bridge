@@ -288,6 +288,8 @@ describe("get_budget tool (handleGetBudget)", () => {
     codex: null,
     driftPct: 0,
     paused: false,
+    gateClosed: false,
+    pauseSide: null,
     pauseReason: null,
     resumeAfterEpoch: null,
     parallelRecommended: false,

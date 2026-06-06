@@ -122,20 +122,41 @@ function parallelState(
   };
 }
 
-function pauseDirective(
+export function renderBudgetInterventionDirective(
   claude: AgentUsage | null,
   codex: AgentUsage | null,
-  triggers: PauseTrigger[],
-  resetEpochs: BudgetState["pause"]["resetEpochs"],
+  side: AgentName | "both",
+  reason: string,
   resumeEpoch: number | null,
   cfg: BudgetConfig,
 ): string {
-  const sideText = triggers.length > 1 ? "双方" : AGENT_LABEL[triggers[0].agent];
+  const resumeText = `预计恢复时间（以实测为准；提前刷新会更早解除）：${formatEpoch(resumeEpoch)}。`;
+  if (side === "claude") {
+    return [
+      "【预算协调 · 账号级】Claude 侧额度紧张，进入接力模式。",
+      `触发方：Claude；原因：${reason}。`,
+      `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
+      `恢复参考：Claude gateUtil 低于 ${pct(cfg.resumeBelow)} 且没有有效 rate_limit；${resumeText}`,
+      "请立即交接：把剩余任务清单、关键上下文、产出位置、验收标准打包成一条 reply 发给 Codex。",
+      "交接后 Claude 停手；要求 Codex 在单 turn 内尽量完成，尾巴写 checkpoint，暂停期不要期待 Claude 回复。",
+    ].join("\n");
+  }
+
+  if (side === "codex") {
+    return [
+      "【预算协调 · 账号级】Codex 侧额度紧张，暂停委派。",
+      `触发方：Codex；原因：${reason}。`,
+      `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
+      `恢复参考：Codex gateUtil 低于 ${pct(cfg.resumeBelow)} 且没有有效 rate_limit；${resumeText}`,
+      "请 Claude 写 checkpoint，并可 solo 推进不依赖 Codex 的独立部分；不要继续向 Codex 委派，标注清楚分工断点。",
+    ].join("\n");
+  }
+
   return [
     "【预算协调 · 账号级】进入联合暂停。",
-    `触发方：${sideText}；原因：${triggers.map((trigger) => trigger.reason).join("；")}。`,
+    `触发方：双方；原因：${reason}。`,
     `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-    `恢复条件：Claude 与 Codex 的 gateUtil 都低于 ${pct(cfg.resumeBelow)}，且没有有效 rate_limit。预计恢复不早于 ${formatEpoch(resumeEpoch)}。`,
+    `恢复条件：Claude 与 Codex 的 gateUtil 都低于 ${pct(cfg.resumeBelow)}，且没有有效 rate_limit；${resumeText}`,
     "请收尾当前步、写 checkpoint、停止继续委派；pause 期间不要重试向 Codex 发送 reply。",
   ].join("\n");
 }
@@ -215,7 +236,14 @@ export function computeBudgetState(
 
   let directiveToClaude: string | null = null;
   if (phase === "paused") {
-    directiveToClaude = pauseDirective(claude, codex, triggers, resetEpochs, filteredResumeAfterEpoch, cfg);
+    directiveToClaude = renderBudgetInterventionDirective(
+      claude,
+      codex,
+      pauseSide ?? "both",
+      triggers.map((trigger) => trigger.reason).join("；"),
+      filteredResumeAfterEpoch,
+      cfg,
+    );
   } else if (phase === "balance" && claude && codex) {
     directiveToClaude = balanceDirective(claude, codex, drift, parallel);
   } else if (phase === "parallel" && claude && codex) {
