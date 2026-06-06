@@ -115,6 +115,26 @@ describe("BudgetCoordinator", () => {
     expect(emitted[0].content).toContain("用量比例漂移");
   });
 
+  test("re-emits balance directive when the lighter side enters a new five-hour window", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3600 } }),
+      },
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 7200 } }),
+      },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_balance"))).toHaveLength(2);
+  });
+
   test("emits pause and resume on pause lifecycle edges", async () => {
     const source = new FakeSource([
       { claude: usage(), codex: usage() },
@@ -163,6 +183,24 @@ describe("BudgetCoordinator", () => {
     expect(second.emitted.filter((event) => event.id.startsWith("system_budget_pause"))).toHaveLength(1);
     expect(first.pauseChanges).toEqual([true]);
     expect(second.pauseChanges).toEqual([true]);
+  });
+
+  test("keeps paused without extra emits when both probes disappear during pause", async () => {
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }), codex: usage() },
+      { claude: null, codex: null },
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, claude: null, codex: null });
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_pause"))).toHaveLength(1);
+    expect(emitted.some((event) => event.id.startsWith("system_budget_resume"))).toBe(false);
+    expect(pauseChanges).toEqual([true]);
   });
 
   test("stop cancels scheduled polling timers", async () => {

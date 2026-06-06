@@ -182,6 +182,7 @@ export class BudgetCoordinator {
   }
 
   private canResume(state: BudgetState): boolean {
+    // Joint pause exits only when BOTH agents have fresh visible usage below resumeBelow.
     return this.canAgentResume(state.perAgent.claude, state.now) && this.canAgentResume(state.perAgent.codex, state.now);
   }
 
@@ -208,11 +209,19 @@ export class BudgetCoordinator {
   }
 
   private directiveFingerprint(state: BudgetState): string {
-    const side = state.pause.side ?? "none";
+    const side = state.phase === "balance"
+      ? state.drift.lighter ?? "none"
+      : state.pause.side ?? "none";
     let reset = 0;
-    if (side === "claude") reset = state.pause.resetEpochs.claude;
-    else if (side === "codex") reset = state.pause.resetEpochs.codex;
-    else if (side === "both") reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    if (state.phase === "balance" && state.drift.lighter) {
+      reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
+    } else if (side === "claude") {
+      reset = state.pause.resetEpochs.claude;
+    } else if (side === "codex") {
+      reset = state.pause.resetEpochs.codex;
+    } else if (side === "both") {
+      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    }
 
     return [
       state.phase,

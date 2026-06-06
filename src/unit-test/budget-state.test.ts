@@ -143,6 +143,19 @@ describe("computeBudgetState", () => {
     expect(codexHeavy.directiveToClaude).toContain("Claude");
   });
 
+  test("balances reverse 20/40 drift toward Claude", () => {
+    const state = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }),
+      usage({ gateUtil: 40, warnUtil: 40, remaining: 60 }),
+      CONFIG,
+      NOW,
+    );
+
+    expect(state.phase).toBe("balance");
+    expect(state.drift).toEqual({ pct: -20, heavier: "codex", lighter: "claude" });
+    expect(state.directiveToClaude).toContain("分给 Claude");
+  });
+
   test("recommends parallel when both sides have high remaining and a nearby five-hour reset", () => {
     const state = computeBudgetState(
       usage({ gateUtil: 20, warnUtil: 20, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 3500 } }),
@@ -172,6 +185,39 @@ describe("computeBudgetState", () => {
       NOW,
     );
     expect(lateReset.phase).toBe("normal");
+  });
+
+  test("parallel boundary matrix only triggers with 61% remaining and 59 minutes to reset", () => {
+    const cfg = { ...CONFIG, syncDriftPct: 100 };
+    const cases = [
+      { remaining: 59, resetSec: 59 * 60, expected: "normal" },
+      { remaining: 59, resetSec: 61 * 60, expected: "normal" },
+      { remaining: 61, resetSec: 59 * 60, expected: "parallel" },
+      { remaining: 61, resetSec: 61 * 60, expected: "normal" },
+    ] as const;
+
+    for (const item of cases) {
+      const gateUtil = 100 - item.remaining;
+      const state = computeBudgetState(
+        usage({
+          gateUtil,
+          warnUtil: gateUtil,
+          remaining: item.remaining,
+          fiveHour: { util: gateUtil, resetEpoch: NOW + item.resetSec },
+        }),
+        usage({
+          gateUtil,
+          warnUtil: gateUtil,
+          remaining: item.remaining,
+          fiveHour: { util: gateUtil, resetEpoch: NOW + item.resetSec },
+        }),
+        cfg,
+        NOW,
+      );
+
+      expect(state.phase).toBe(item.expected);
+      expect(state.parallel.recommended).toBe(item.expected === "parallel");
+    }
   });
 
   test("combines balance and parallel into one balance directive", () => {
