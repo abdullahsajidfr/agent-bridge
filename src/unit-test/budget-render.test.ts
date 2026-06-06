@@ -29,6 +29,7 @@ function snapshot(overrides: Partial<BudgetSnapshot> = {}): BudgetSnapshot {
     resumeAfterEpoch: null,
     parallelRecommended: false,
     codexTier: "full",
+    claudeAdvice: null,
     ...overrides,
   };
 }
@@ -95,5 +96,19 @@ describe("renderBudgetSnapshot", () => {
 
   test("unavailable text mentions the probe path", () => {
     expect(BUDGET_UNAVAILABLE_TEXT).toContain("budget-probe");
+  });
+});
+
+describe("renderBudgetSnapshot — claudeAdvice", () => {
+  test("shows the Claude tiering advice when present", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({ claudeAdvice: "Claude 侧用量偏高：机械型 subagent 用 haiku，常规用 sonnet" }),
+    );
+    expect(text).toContain("Claude 建议：");
+    expect(text).toContain("haiku");
+  });
+
+  test("omits the advice line when null", () => {
+    expect(renderBudgetSnapshot(snapshot({ claudeAdvice: null }))).not.toContain("Claude 建议：");
   });
 });

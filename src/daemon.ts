@@ -127,7 +127,10 @@ function ensureBudgetCoordinatorStarted() {
       `Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` +
       `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` +
       `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` +
-      `codexTierControl=${BUDGET_CONFIG.codexTierControl}`,
+      `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` +
+      // Normalization degrades tier control to false when the sticky-restore
+      // point is missing; surface that state so the degrade is diagnosable.
+      `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"}`,
     );
     budgetCoordinator = new BudgetCoordinator({
       source: createQuotaSource({ log }),
@@ -511,7 +514,13 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         contentToSend += REPLY_REQUIRED_INSTRUCTION;
       }
       log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentToSend);
+      // Budget tier overrides (P4/R5) piggyback on this user-initiated turn —
+      // never injected standalone. Delivery is confirmed back to the coordinator
+      // so the pending override is sent at most once per tier change.
+      const tierOverrides = BUDGET_CONFIG.codexTierControl
+        ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined
+        : undefined;
+      const injected = codex.injectMessage(contentToSend, tierOverrides);
       if (!injected) {
         const reason = codex.turnInProgress
           ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
@@ -524,6 +533,9 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           error: reason,
         });
         return;
+      }
+      if (tierOverrides) {
+        budgetCoordinator?.notifyOverridesDelivered();
       }
       // Arm reply-required tracking ONLY after a successful injection: a turn has
       // now started, so turnCompleted will reset it. Arming before this guard

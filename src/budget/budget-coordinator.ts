@@ -5,6 +5,7 @@ import type {
   BudgetConfig,
   BudgetSnapshot,
   BudgetState,
+  CodexTier,
   CodexTurnOverrides,
 } from "./types";
 import type { QuotaSource } from "./quota-source";
@@ -62,6 +63,10 @@ export class BudgetCoordinator {
   private latestSnapshot: BudgetSnapshot | null = null;
   private pauseReason: string | null = null;
   private pauseResumeAfterEpoch: number | null = null;
+  private pendingOverrideTier: CodexTier | null = null;
+  private pendingOverrides: CodexTurnOverrides | null = null;
+  private lastAppliedTier: CodexTier = "full";
+  private missingFullMappingLogged = false;
   private sequence = 0;
 
   constructor(options: BudgetCoordinatorOptions) {
@@ -97,7 +102,15 @@ export class BudgetCoordinator {
   }
 
   getCodexTurnOverrides(): CodexTurnOverrides | null {
-    return null;
+    if (!this.tierControlEnabled()) return null;
+    return this.pendingOverrides ? { ...this.pendingOverrides } : null;
+  }
+
+  notifyOverridesDelivered(): void {
+    if (!this.pendingOverrideTier) return;
+    this.lastAppliedTier = this.pendingOverrideTier;
+    this.pendingOverrideTier = null;
+    this.pendingOverrides = null;
   }
 
   private scheduleNext(): void {
@@ -133,6 +146,7 @@ export class BudgetCoordinator {
     }
 
     const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
+    this.updatePendingOverrides(state.effort.codexTier);
     this.applyState(state);
     this.latestSnapshot = this.toSnapshot(state);
   }
@@ -208,6 +222,42 @@ export class BudgetCoordinator {
     return 0;
   }
 
+  private tierControlEnabled(): boolean {
+    if (!this.config.codexTierControl) return false;
+    if (this.config.codexTiers.full) return true;
+    if (!this.missingFullMappingLogged) {
+      this.missingFullMappingLogged = true;
+      this.log("Codex tier control disabled: budget.codexTiers.full restore mapping is missing");
+    }
+    return false;
+  }
+
+  private updatePendingOverrides(tier: CodexTier): void {
+    if (!this.tierControlEnabled()) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+
+    if (this.lastAppliedTier === tier) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+
+    if (this.pendingOverrideTier === tier) return;
+
+    const overrides = this.config.codexTiers[tier];
+    if (!overrides) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+
+    this.pendingOverrideTier = tier;
+    this.pendingOverrides = { ...overrides };
+  }
+
   private directiveFingerprint(state: BudgetState): string {
     const side = state.phase === "balance"
       ? state.drift.lighter ?? "none"
@@ -257,6 +307,7 @@ export class BudgetCoordinator {
       resumeAfterEpoch: paused ? state.pause.resumeAfterEpoch ?? this.pauseResumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
+      claudeAdvice: state.effort.claudeAdvice,
     };
   }
 }

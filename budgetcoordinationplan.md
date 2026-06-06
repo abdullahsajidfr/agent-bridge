@@ -137,7 +137,7 @@ flowchart TD
 4. **双侧 reset_epoch 不一致**：解除需双方达标（保守换一致性，防协作状态分叉）。
 5. **pull 模式自动唤醒失效**：R4 自动唤醒依赖 push（默认）；pull 模式记 warning 日志 + 文档声明 + P5 watchdog 兜底。
 6. **指令刷屏 / 重启重复 STOP**：内存去重 + 材料变化才发；重启允许单次幂等重发（文档化 + 测试覆盖）。
-7. **版本偏移**：当前版 `TurnStartParams` 无 `deny_unknown_fields`（turn.rs 实证），**但「老版本未知字段静默忽略」是合理推断而非跨版本实证** → 无 JSON-RPC error 仅记为 *transport accepted*（不承诺 applied）+ 日志；`codexTierControl` 默认关。不报错不阻断。
+7. **版本偏移**：当前版 `TurnStartParams` 无 `deny_unknown_fields`（turn.rs 实证），**但「老版本未知字段静默忽略」是合理推断而非跨版本实证** → 无 JSON-RPC error 仅记为 *transport accepted*（不承诺 applied）+ 日志；`codexTierControl` 默认关。不报错不阻断。**【P4 gate 备案的 v1 已知限制】**若 turn/start 在 transport 接受后仍以 JSON-RPC error 失败，`lastAppliedTier` 会乐观记账（认为已投递而实际未应用）——错误意味着 turn 未启动、override 同样未生效，偏差只造成「少省一次额度」，并在下一次 tier 切换时自愈；不引入回滚记账复杂度。
 8. **与 guard 阈值耦合**：bridge `pauseAt=90` 刻意先于 guard 硬线 92（收尾预算），guard 是逃逸 backstop；两套阈值独立配置、文档写明关系。
 
 ## Git 与分工

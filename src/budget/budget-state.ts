@@ -1,4 +1,4 @@
-import type { AgentName, AgentUsage, BudgetConfig, BudgetState } from "./types";
+import type { AgentName, AgentUsage, BudgetConfig, BudgetState, CodexTier } from "./types";
 
 interface PauseTrigger {
   agent: AgentName;
@@ -9,6 +9,12 @@ const AGENT_LABEL: Record<AgentName, string> = {
   claude: "Claude",
   codex: "Codex",
 };
+
+// R5 v1 Codex tier bands use warnUtil, not gateUtil: model/effort economy is a
+// soft-cost control, while gateUtil remains reserved for R4 hard pause gating.
+const CODEX_BALANCED_WARN_UTIL = 60;
+const CODEX_ECO_WARN_UTIL = 80;
+const CLAUDE_ADVICE_WARN_UTIL = 80;
 
 function pct(value: number): string {
   return `${Math.round(value * 10) / 10}%`;
@@ -165,6 +171,18 @@ function parallelDirective(
   ].join("\n");
 }
 
+function codexTierFor(codex: AgentUsage | null): CodexTier {
+  if (!codex) return "full";
+  if (codex.warnUtil >= CODEX_ECO_WARN_UTIL) return "eco";
+  if (codex.warnUtil >= CODEX_BALANCED_WARN_UTIL) return "balanced";
+  return "full";
+}
+
+function claudeAdviceFor(claude: AgentUsage | null): string | null {
+  if (!claude || claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL) return null;
+  return `Claude warnUtil ${pct(claude.warnUtil)} 已偏高；后续可拆分 subagent 建议降档到 haiku/sonnet，并保留高难度主线给当前会话。`;
+}
+
 export function computeBudgetState(
   claude: AgentUsage | null,
   codex: AgentUsage | null,
@@ -218,7 +236,7 @@ export function computeBudgetState(
       resetEpochs,
     },
     parallel,
-    effort: { claudeAdvice: null, codexTier: "full" },
+    effort: { claudeAdvice: claudeAdviceFor(claude), codexTier: codexTierFor(codex) },
     directiveToClaude,
   };
 }

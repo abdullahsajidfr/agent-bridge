@@ -173,6 +173,11 @@ describe("ConfigService — budget section", () => {
       syncDriftPct: 10,
       parallel: { minRemainingPct: 60, timeWindowSec: 3600 },
       codexTierControl: false,
+      codexTiers: {
+        full: null,
+        balanced: { effort: "medium" },
+        eco: { effort: "low" },
+      },
     });
   });
 
@@ -195,6 +200,7 @@ describe("ConfigService — budget section", () => {
         syncDriftPct: 8,
         parallel: { minRemainingPct: 50, timeWindowSec: 1800 },
         codexTierControl: true,
+        codexTiers: { full: { effort: "high" }, eco: { effort: "minimal" } },
       },
     });
     const loaded = svc.load();
@@ -206,7 +212,38 @@ describe("ConfigService — budget section", () => {
       syncDriftPct: 8,
       parallel: { minRemainingPct: 50, timeWindowSec: 1800 },
       codexTierControl: true,
+      codexTiers: {
+        full: { effort: "high" },
+        balanced: { effort: "medium" }, // unspecified tier keeps the default
+        eco: { effort: "minimal" },
+      },
     });
+  });
+
+  test("codexTierControl degrades to false when codexTiers.full is missing", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ budget: { codexTierControl: true } });
+    const loaded = svc.load();
+    // Sticky turn/start overrides need an explicit restore point.
+    expect(loaded!.budget.codexTierControl).toBe(false);
+    expect(loaded!.budget.codexTiers.full).toBeNull();
+  });
+
+  test("tier overrides drop empty/non-string fields", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({
+      budget: {
+        codexTierControl: true,
+        codexTiers: {
+          full: { effort: "  high  ", model: "" },
+          balanced: { effort: 5 },
+        },
+      },
+    });
+    const loaded = svc.load();
+    expect(loaded!.budget.codexTiers.full).toEqual({ effort: "high" }); // trimmed, empty model dropped
+    expect(loaded!.budget.codexTiers.balanced).toEqual({ effort: "medium" }); // invalid → default
+    expect(loaded!.budget.codexTierControl).toBe(true);
   });
 
   test("out-of-range budget values fall back to defaults", () => {
@@ -254,6 +291,11 @@ describe("applyBudgetEnvOverrides", () => {
     syncDriftPct: 10,
     parallel: { minRemainingPct: 60, timeWindowSec: 3600 },
     codexTierControl: false,
+    codexTiers: {
+      full: { effort: "high" }, // restore point present so env can flip tier control on
+      balanced: { effort: "medium" },
+      eco: { effort: "low" },
+    },
   };
 
   test("env values override the base config", () => {
@@ -303,6 +345,11 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
     syncDriftPct: 10,
     parallel: { minRemainingPct: 60, timeWindowSec: 3600 },
     codexTierControl: false,
+    codexTiers: {
+      full: { effort: "high" },
+      balanced: { effort: "medium" },
+      eco: { effort: "low" },
+    },
   };
 
   test('accepts "0"/"1" alongside "true"/"false"', () => {

@@ -15,6 +15,11 @@ const CONFIG: BudgetConfig = {
     timeWindowSec: 3600,
   },
   codexTierControl: false,
+  codexTiers: {
+    full: { effort: "high" },
+    balanced: { effort: "medium" },
+    eco: { effort: "low" },
+  },
 };
 
 function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
@@ -241,5 +246,46 @@ describe("computeBudgetState", () => {
     expect(state.drift).toEqual({ pct: 0, heavier: null, lighter: null });
     expect(state.parallel.recommended).toBe(false);
     expect(state.directiveToClaude).toBeNull();
+  });
+
+  test("assigns Codex tier by codex warnUtil boundaries", () => {
+    const cases = [
+      { warnUtil: 59, expected: "full" },
+      { warnUtil: 60, expected: "balanced" },
+      { warnUtil: 79, expected: "balanced" },
+      { warnUtil: 80, expected: "eco" },
+    ] as const;
+
+    for (const item of cases) {
+      const state = computeBudgetState(
+        usage({ gateUtil: 20, warnUtil: 20 }),
+        usage({ gateUtil: 20, warnUtil: item.warnUtil }),
+        { ...CONFIG, syncDriftPct: 100 },
+        NOW,
+      );
+
+      expect(state.effort.codexTier).toBe(item.expected);
+    }
+  });
+
+  test("advises Claude subagent downgrade when Claude warnUtil is high", () => {
+    const high = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 80 }),
+      usage({ gateUtil: 20, warnUtil: 20 }),
+      CONFIG,
+      NOW,
+    );
+
+    expect(high.effort.claudeAdvice).toContain("subagent");
+    expect(high.effort.claudeAdvice).toContain("haiku");
+    expect(high.effort.claudeAdvice).toContain("sonnet");
+
+    const low = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 79 }),
+      usage({ gateUtil: 20, warnUtil: 20 }),
+      CONFIG,
+      NOW,
+    );
+    expect(low.effort.claudeAdvice).toBeNull();
   });
 });

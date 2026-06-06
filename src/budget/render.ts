@@ -71,6 +71,9 @@ export function renderBudgetSnapshot(snapshot: BudgetSnapshot): string {
   if (snapshot.codexTier !== "full") {
     lines.push(`Codex 档位：${snapshot.codexTier}`);
   }
+  if (snapshot.claudeAdvice) {
+    lines.push(`Claude 建议：${snapshot.claudeAdvice}`);
+  }
 
   lines.push("注：百分比为订阅账号级用量（同机其他会话共享同一额度池）。");
   return lines.join("\n");

@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import type { BudgetConfig } from "./budget/types";
+import type { BudgetConfig, CodexTierMap, CodexTurnOverrides } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -30,6 +30,13 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     timeWindowSec: 3600,
   },
   codexTierControl: false,
+  codexTiers: {
+    // `full` is the explicit restore point for sticky turn/start overrides; tier
+    // control only activates when the user configures it (see normalize below).
+    full: null,
+    balanced: { effort: "medium" },
+    eco: { effort: "low" },
+  },
 };
 
 const DEFAULT_CONFIG: AgentBridgeConfig = {
@@ -98,15 +105,39 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+/** Normalize one tier override object: keep only non-empty string model/effort. */
+function normalizeCodexOverride(raw: unknown): CodexTurnOverrides | null {
+  if (!isRecord(raw)) return null;
+  const override: CodexTurnOverrides = {};
+  if (typeof raw.model === "string" && raw.model.trim() !== "") override.model = raw.model.trim();
+  if (typeof raw.effort === "string" && raw.effort.trim() !== "") override.effort = raw.effort.trim();
+  return Object.keys(override).length > 0 ? override : null;
+}
+
+function normalizeCodexTiers(raw: unknown): CodexTierMap {
+  const tiers = isRecord(raw) ? raw : {};
+  return {
+    full: normalizeCodexOverride(tiers.full),
+    balanced:
+      normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco,
+  };
+}
+
 /**
  * Normalize the budget section with boundary protection: out-of-range values
  * fall back to defaults, and an unsatisfiable pause lifecycle
  * (pauseAt <= resumeBelow) resets BOTH thresholds to defaults so the
  * coordinator can never enter a pause it cannot exit.
+ *
+ * Tier-control activation rule (single source of truth): `codexTierControl`
+ * stays true ONLY when `codexTiers.full` is configured — sticky turn/start
+ * overrides cannot be restored without an explicit restore point.
  */
 function normalizeBudgetConfig(raw: unknown): BudgetConfig {
   const budget = isRecord(raw) ? raw : {};
   const parallel = isRecord(budget.parallel) ? budget.parallel : {};
+  const codexTiers = normalizeCodexTiers(budget.codexTiers);
 
   let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
   let resumeBelow = normalizeBoundedInteger(
@@ -150,10 +181,10 @@ function normalizeBudgetConfig(raw: unknown): BudgetConfig {
         604800,
       ),
     },
-    codexTierControl: normalizeBoolean(
-      budget.codexTierControl,
-      DEFAULT_BUDGET_CONFIG.codexTierControl,
-    ),
+    codexTierControl:
+      normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) &&
+      codexTiers.full !== null,
+    codexTiers,
   };
 }
 
@@ -178,6 +209,9 @@ export function applyBudgetEnvOverrides(
         env.AGENTBRIDGE_BUDGET_PARALLEL_TIME_WINDOW_SEC ?? budget.parallel.timeWindowSec,
     },
     codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
+    // Tier mapping is file-config only (nested structure doesn't fit env vars);
+    // re-normalization re-applies the full-restore activation rule.
+    codexTiers: budget.codexTiers,
   };
   return normalizeBudgetConfig(overlay);
 }

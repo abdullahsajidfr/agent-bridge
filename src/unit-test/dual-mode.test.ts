@@ -292,6 +292,7 @@ describe("get_budget tool (handleGetBudget)", () => {
     resumeAfterEpoch: null,
     parallelRecommended: false,
     codexTier: "full" as const,
+    claudeAdvice: null,
   };
 
   test("returns unavailable text when no snapshot is cached", () => {

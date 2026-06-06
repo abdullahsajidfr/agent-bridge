@@ -255,12 +255,114 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 45000);
+
+  test("codex tier overrides ride on turn/start and restore explicitly (P4/R5)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-tier-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 7200 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 10);
+    writeUsage("codex", 85); // eco band (≥80) but below pauseAt=90 — no pause
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line));
+    };
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgettier",
+        pairName: "main",
+        projectConfig: {
+          version: "1.0",
+          budget: {
+            codexTierControl: true,
+            codexTiers: { full: { effort: "high" } }, // explicit restore point activates control
+          },
+        },
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Wait until the coordinator's first poll computed the eco tier.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.codexTier === "eco";
+        } catch {
+          return false;
+        }
+      }, "codexTier=eco on /healthz", 200, 100);
+
+      // Injection 1 carries the eco override (default mapping effort=low).
+      harness.sendClaudeToCodex("req-tier-1", "task under eco tier");
+      await waitFor(() => readTurnStarts().length >= 1, "first recorded turn/start", 100, 100);
+      const first = readTurnStarts()[0]!;
+      expect(first.effort).toBe("low");
+
+      // Tier returns to full → explicit restore override on the next injection.
+      writeUsage("codex", 10);
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.codexTier === "full";
+        } catch {
+          return false;
+        }
+      }, "codexTier back to full", 400, 50);
+      harness.sendClaudeToCodex("req-tier-2", "task after restore");
+      await waitFor(() => readTurnStarts().length >= 2, "second recorded turn/start", 100, 100);
+      const second = readTurnStarts()[1]!;
+      expect(second.effort).toBe("high"); // configured codexTiers.full restore value
+
+      // Pending consumed: a further injection carries NO override.
+      harness.sendClaudeToCodex("req-tier-3", "steady state");
+      await waitFor(() => readTurnStarts().length >= 3, "third recorded turn/start", 100, 100);
+      const third = readTurnStarts()[2]!;
+      expect(third.effort).toBeUndefined();
+      expect(third.model).toBeUndefined();
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 async function startHarness(opts: {
   pairId: string;
   pairName: string;
   extraEnv?: Record<string, string>;
+  /** Optional .agentbridge/config.json content written into the daemon cwd before spawn. */
+  projectConfig?: unknown;
 }): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "agentbridge-daemon-wiring-"));
   const cwdPath = join(root, "project");
@@ -271,6 +373,11 @@ async function startHarness(opts: {
   const cwd = realpathSync(cwdPath);
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(binDir, { recursive: true });
+
+  if (opts.projectConfig !== undefined) {
+    mkdirSync(join(cwd, ".agentbridge"), { recursive: true });
+    writeFileSync(join(cwd, ".agentbridge", "config.json"), JSON.stringify(opts.projectConfig));
+  }
 
   const { slot, ports } = await reserveFreePairSlot();
   const { appPort, proxyPort, controlPort } = ports;
@@ -413,7 +520,7 @@ async function startHarness(opts: {
 
 function fakeCodexScript(): string {
   return `#!/usr/bin/env bun
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 
 if (process.argv.includes("--version")) {
   console.log("codex fake");
@@ -453,6 +560,10 @@ const server = Bun.serve({
         const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
         if (msg.method === "thread/start") {
           ws.send(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-fake-1" } } }));
+        }
+        // Record received turn/start params (tier-override assertions).
+        if (msg.method === "turn/start" && process.env.FAKE_APP_TURNSTART_LOG) {
+          appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
         }
       } catch {}
     },

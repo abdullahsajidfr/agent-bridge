@@ -15,6 +15,11 @@ const CONFIG: BudgetConfig = {
     timeWindowSec: 3600,
   },
   codexTierControl: false,
+  codexTiers: {
+    full: { effort: "high" },
+    balanced: { effort: "medium" },
+    eco: { effort: "low" },
+  },
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;
@@ -52,18 +57,20 @@ class FakeSource {
   }
 }
 
-function makeCoordinator(source: FakeSource) {
+function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
   const emitted: Array<{ id: string; content: string }> = [];
   const pauseChanges: boolean[] = [];
+  const logs: string[] = [];
   const coordinator = new BudgetCoordinator({
     source,
-    config: CONFIG,
+    config,
     emit: (id, content) => emitted.push({ id, content }),
     onPauseChange: (paused) => pauseChanges.push(paused),
     now: () => NOW,
+    log: (message) => logs.push(message),
   });
 
-  return { coordinator, emitted, pauseChanges };
+  return { coordinator, emitted, pauseChanges, logs };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -255,5 +262,95 @@ describe("BudgetCoordinator", () => {
     });
     expect(emitted).toEqual([]);
     expect(pauseChanges).toEqual([]);
+  });
+
+  test("queues pending Codex overrides, clears after delivery, and does not requeue same tier", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 60 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 60 }) },
+    ]);
+    const { coordinator } = makeCoordinator(source, { ...CONFIG, codexTierControl: true });
+
+    await coordinator.start();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "medium" });
+    coordinator.notifyOverridesDelivered();
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+  });
+
+  test("updates pending Codex overrides to the latest tier before delivery", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 60 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 80 }) },
+    ]);
+    const { coordinator } = makeCoordinator(source, { ...CONFIG, codexTierControl: true });
+
+    await coordinator.start();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "medium" });
+
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+  });
+
+  test("returns null overrides when Codex tier control is disabled", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 80 }) },
+    ]);
+    const { coordinator } = makeCoordinator(source, { ...CONFIG, codexTierControl: false });
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+  });
+
+  test("stores Claude tiering advice in the latest snapshot", async () => {
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 20, warnUtil: 80 }), codex: usage({ gateUtil: 20, warnUtil: 20 }) },
+    ]);
+    const { coordinator } = makeCoordinator(source);
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.getSnapshot()?.claudeAdvice).toContain("haiku");
+  });
+
+  test("queues explicit full restore after delivering a lower tier", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 80 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 20 }) },
+    ]);
+    const { coordinator } = makeCoordinator(source, { ...CONFIG, codexTierControl: true });
+
+    await coordinator.start();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+    coordinator.notifyOverridesDelivered();
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "high" });
+  });
+
+  test("disables Codex tier control when full restore mapping is missing", async () => {
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 80 }) },
+    ]);
+    const { coordinator, logs } = makeCoordinator(source, {
+      ...CONFIG,
+      codexTierControl: true,
+      codexTiers: { ...CONFIG.codexTiers, full: null },
+    });
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+    expect(logs.filter((message) => message.includes("full restore mapping"))).toHaveLength(1);
   });
 });

@@ -74,6 +74,8 @@ export interface BudgetConfig {
   };
   /** When false (default), model/effort overrides are never injected into turn/start. */
   codexTierControl: boolean;
+  /** Tier → override mapping; `full` must be configured for tier control to activate. */
+  codexTiers: CodexTierMap;
 }
 
 /** Pure-function output of computeBudgetState(). */
@@ -118,10 +120,28 @@ export interface BudgetSnapshot {
   resumeAfterEpoch: number | null;
   parallelRecommended: boolean;
   codexTier: CodexTier;
+  /** Advisory for Claude-side subagent model tiering when its budget is tight; null when none. */
+  claudeAdvice: string | null;
 }
 
 /** Optional per-turn overrides injected into Codex turn/start (sticky on the thread). */
 export interface CodexTurnOverrides {
   model?: string;
   effort?: string;
+}
+
+/**
+ * Per-tier turn/start override values (P4 / R5).
+ *
+ * `full` is the explicit RESTORE point: turn/start overrides are sticky on the
+ * thread and we cannot know the user's original model/effort, so tier control
+ * only activates when the user configures the values to restore to. When
+ * `codexTierControl` is true but `full` is null, the daemon degrades tier
+ * control to disabled (with one log line).
+ */
+export interface CodexTierMap {
+  /** Restore values; REQUIRED for tier control to activate. */
+  full: CodexTurnOverrides | null;
+  balanced: CodexTurnOverrides;
+  eco: CodexTurnOverrides;
 }
