@@ -48,6 +48,7 @@ agent-router agents:status
 agent-router task:assign --to gemini --objective "Implement the parser" --dry-run
 agent-router task:review --to copilot --diff
 agent-router task:run-plan --planner codex --objective "Add login tests"
+agent-router task:run-plan --planner codex --objective "Add login tests" --execute
 agent-router rooms:list
 agent-router rooms:show <roomId>
 agent-router worktrees:clean
@@ -74,8 +75,20 @@ If an adapter returns plain text, AgentRouter still records stdout/stderr, comma
 
 ## Orchestration Flow
 
-1. Run `task:run-plan` to ask Codex for a delegation plan.
+For fully automatic dispatch, run:
+
+```sh
+agent-router task:run-plan --planner codex --objective "Add login tests" --execute
+```
+
+The router asks Codex for a machine-readable JSON plan, parses every subtask, dispatches each subtask to the named adapter, records the task room, and returns a composite result.
+
+Manual flow is still available:
+
+1. Run `task:run-plan` to ask Codex for a delegation plan without dispatching it.
 2. Assign implementation tasks to Cursor or Gemini with `task:assign`.
 3. Assign review or test tasks to Copilot CLI or Gemini.
 4. Inspect structured results and worktree diffs.
 5. Apply final changes to the main working tree only after human approval.
+
+Planner output can be strict JSON, fenced JSON, Codex JSONL containing a JSON plan string, or simple markdown assignments such as `- gemini: Implement parser`.

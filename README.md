@@ -201,6 +201,7 @@ AgentRouter is the local multi-agent orchestration layer added in this fork. Cod
 | `agent-router task:assign --to gemini --objective "..."` | Assign a task to a subagent |
 | `agent-router task:review --to copilot --diff` | Ask a reviewer subagent to review the current git diff |
 | `agent-router task:run-plan --planner codex --objective "..."` | Ask Codex for an orchestration plan |
+| `agent-router task:run-plan --planner codex --objective "..." --execute` | Parse Codex's plan and dispatch every subtask automatically |
 | `agent-router rooms:list` | List persisted task rooms |
 | `agent-router rooms:show <roomId>` | Show a room and its task records |
 | `agent-router worktrees:clean` | Remove router-created worktree directory |

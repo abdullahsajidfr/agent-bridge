@@ -7,6 +7,7 @@ import { RoomManager } from "./room-manager";
 import { TaskManager } from "./task-manager";
 import { WorktreeManager } from "../supervisor/worktree-manager";
 import type { Room, TaskRecord } from "../protocol/types";
+import { parseAgentPlan, type ParsedAgentPlan } from "./plan-parser";
 
 interface AssignTaskInput {
   to: string;
@@ -18,6 +19,15 @@ interface AssignTaskInput {
   constraints?: string[];
   roomId?: string;
   dryRun?: boolean;
+}
+
+export interface PlanDispatchResult {
+  roomId: string;
+  plan: ParsedAgentPlan;
+  plannerResult: AgentResult;
+  subtaskResults: AgentResult[];
+  status: "success" | "failed" | "partial";
+  summary: string;
 }
 
 export class AgentRouter {
@@ -89,6 +99,48 @@ export class AgentRouter {
       canRunCommands: true,
     });
   }
+
+  async runPlanAndDispatch(plannerId: string, objective: string, dryRun?: boolean): Promise<PlanDispatchResult> {
+    const plannerResult = await this.runPlan(plannerId, objective);
+    const plannerTask = this.tasks.get(plannerResult.taskId)?.task;
+    const roomId = plannerTask?.roomId ?? this.rooms.create(objective).id;
+    const plan = parseAgentPlan(plannerText(plannerResult));
+    const subtaskResults: AgentResult[] = [];
+
+    for (const plannedTask of plan.tasks) {
+      subtaskResults.push(await this.assign({
+        to: plannedTask.to,
+        objective: plannedTask.objective,
+        instructions: plannedTask.instructions,
+        expectedOutput: plannedTask.expectedOutput,
+        canEditFiles: plannedTask.canEditFiles,
+        canRunCommands: plannedTask.canRunCommands,
+        constraints: plannedTask.constraints,
+        roomId,
+        dryRun,
+      }));
+    }
+
+    const failedCount = subtaskResults.filter((result) => result.status === "failed" || result.status === "cancelled").length;
+    const partialCount = subtaskResults.filter((result) => result.status === "partial").length;
+    const status = failedCount === 0 && partialCount === 0 ? "success" : failedCount === subtaskResults.length ? "failed" : "partial";
+
+    return {
+      roomId,
+      plan,
+      plannerResult,
+      subtaskResults,
+      status,
+      summary: `Dispatched ${subtaskResults.length} planned task(s): ${subtaskResults.length - failedCount} completed, ${failedCount} failed.`,
+    };
+  }
+}
+
+function plannerText(result: AgentResult): string {
+  return [
+    result.summary,
+    result.commandsRun.map((command) => command.stdout).filter(Boolean).join("\n"),
+  ].filter(Boolean).join("\n");
 }
 
 export function plannerPrompt(objective: string): string {
@@ -99,6 +151,20 @@ export function plannerPrompt(objective: string): string {
     "Delegate each task to one subagent.",
     "Prefer isolated worktrees for implementation.",
     "Require every subagent to return summary, changed files, diff, commands run, tests run, errors, risks, and follow-up questions.",
+    "Return only JSON. Do not wrap it in markdown.",
+    "The JSON must match this shape:",
+    JSON.stringify({
+      summary: "brief plan summary",
+      tasks: [{
+        to: "gemini | cursor | copilot",
+        objective: "short task objective",
+        instructions: "specific instructions for the assigned subagent",
+        expectedOutput: "patch | review | answer | test-report",
+        canEditFiles: true,
+        canRunCommands: true,
+        constraints: ["constraint"],
+      }],
+    }, null, 2),
     "",
     `User objective: ${objective}`,
   ].join("\n");

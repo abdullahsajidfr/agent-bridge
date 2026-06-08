@@ -8,9 +8,8 @@ import { DEFAULT_AGENT_ROUTER_CONFIG, type AgentRouterConfig } from "../agent-ro
 import type { AgentAdapter, AgentResult, AgentStatus, AgentTask } from "../agent-router/protocol/types";
 
 class MockAdapter implements AgentAdapter {
-  id = "gemini";
-  type = "gemini" as const;
-  role = "implementer" as const;
+  readonly type: AgentAdapter["type"];
+  readonly role: AgentAdapter["role"];
   capabilities = {
     canEditFiles: false,
     canRunShell: true,
@@ -18,7 +17,17 @@ class MockAdapter implements AgentAdapter {
     supportsSessionResume: false,
     supportsStructuredOutput: true,
   };
-  sentTask: AgentTask | null = null;
+  sentTasks: AgentTask[] = [];
+
+  constructor(
+    readonly id = "gemini",
+    type: AgentAdapter["type"] = "gemini",
+    role: AgentAdapter["role"] = "implementer",
+    private readonly summary = "mocked",
+  ) {
+    this.type = type;
+    this.role = role;
+  }
 
   async start() {}
   async stop() {}
@@ -27,12 +36,12 @@ class MockAdapter implements AgentAdapter {
     return { id: this.id, type: this.type, role: this.role, available: true };
   }
   async send(task: AgentTask): Promise<AgentResult> {
-    this.sentTask = task;
+    this.sentTasks.push(task);
     return {
       taskId: task.id,
       agentId: this.id,
       status: "success",
-      summary: "mocked",
+      summary: this.summary,
       changedFiles: [],
       commandsRun: [],
       testsRun: [],
@@ -71,8 +80,43 @@ describe("AgentRouter", () => {
     });
 
     expect(result.summary).toBe("mocked");
-    expect(adapter.sentTask?.from).toBe("codex");
+    expect(adapter.sentTasks[0].from).toBe("codex");
     expect(router.tasks.get(result.taskId)?.status).toBe("success");
     expect(router.rooms.list()).toHaveLength(1);
+  });
+
+  test("runs a planner task and dispatches every parsed subtask", async () => {
+    const planner = new MockAdapter(
+      "codex",
+      "codex",
+      "planner",
+      JSON.stringify({
+        summary: "Two task plan",
+        tasks: [
+          { to: "gemini", objective: "Implement parser", expectedOutput: "patch", canEditFiles: false },
+          { to: "copilot", objective: "Review parser", expectedOutput: "review", canEditFiles: false },
+        ],
+      }),
+    );
+    const gemini = new MockAdapter("gemini", "gemini", "implementer", "implemented");
+    const copilot = new MockAdapter("copilot", "copilot", "reviewer", "reviewed");
+    const registry = new AgentRegistry();
+    registry.register(planner);
+    registry.register(gemini);
+    registry.register(copilot);
+    const config: AgentRouterConfig = {
+      ...structuredClone(DEFAULT_AGENT_ROUTER_CONFIG),
+      repoPath: tempDir,
+      dryRun: true,
+    };
+    const router = new AgentRouter(config, registry);
+
+    const result = await router.runPlanAndDispatch("codex", "Build parser", true);
+
+    expect(result.status).toBe("success");
+    expect(result.plan.tasks).toHaveLength(2);
+    expect(result.subtaskResults.map((item) => item.agentId)).toEqual(["gemini", "copilot"]);
+    expect(gemini.sentTasks[0].roomId).toBe(planner.sentTasks[0].roomId);
+    expect(copilot.sentTasks[0].roomId).toBe(planner.sentTasks[0].roomId);
   });
 });

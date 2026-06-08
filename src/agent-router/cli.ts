@@ -80,7 +80,9 @@ async function main() {
       const objective = requireOption(options, "objective");
       const { router, config } = loadRuntime(configService, options["dry-run"] === "true");
       const planner = options.planner ?? config.planner;
-      const result = await router.runPlan(planner, objective);
+      const result = options.execute === "true"
+        ? await router.runPlanAndDispatch(planner, objective, options["dry-run"] === "true" || config.dryRun)
+        : await router.runPlan(planner, objective);
       saveRuntimeState(router);
       console.log(JSON.stringify(result, null, 2));
       return;
@@ -188,6 +190,7 @@ Commands:
   task:assign --to gemini --objective "..."
   task:review --to copilot --diff
   task:run-plan --planner codex --objective "..."
+  task:run-plan --planner codex --objective "..." --execute
   rooms:list
   rooms:show <roomId>
   worktrees:clean
