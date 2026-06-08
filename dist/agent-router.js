@@ -214,6 +214,7 @@ class AgentRegistry {
 }
 
 // src/agent-router/daemon/router.ts
+import { readFileSync as readFileSync2 } from "fs";
 import { resolve as resolve3 } from "path";
 
 // src/agent-router/daemon/policy-engine.ts
@@ -530,10 +531,11 @@ class AgentRouter {
     return result;
   }
   async runPlan(plannerId, objective) {
+    const availableAgents = this.registry.list().filter((agent) => agent.id !== plannerId);
     return await this.assign({
       to: plannerId,
       objective,
-      instructions: plannerPrompt(objective),
+      instructions: plannerPrompt(objective, availableAgents),
       expectedOutput: "answer",
       canEditFiles: false,
       canRunCommands: true
@@ -574,33 +576,61 @@ class AgentRouter {
 function plannerText(result) {
   return [
     result.summary,
+    fullStdoutFromRawLog(result.rawLogPath),
     result.commandsRun.map((command) => command.stdout).filter(Boolean).join(`
 `)
   ].filter(Boolean).join(`
 `);
 }
-function plannerPrompt(objective) {
+function fullStdoutFromRawLog(rawLogPath) {
+  if (!rawLogPath)
+    return;
+  try {
+    const rawLog = readFileSync2(rawLogPath, "utf8");
+    const stdoutMarker = `
+STDOUT:
+`;
+    const stderrMarker = `
+
+STDERR:
+`;
+    const stdoutStart = rawLog.indexOf(stdoutMarker);
+    if (stdoutStart === -1)
+      return rawLog;
+    const contentStart = stdoutStart + stdoutMarker.length;
+    const stderrStart = rawLog.indexOf(stderrMarker, contentStart);
+    return rawLog.slice(contentStart, stderrStart === -1 ? undefined : stderrStart);
+  } catch {
+    return;
+  }
+}
+function plannerPrompt(objective, availableAgents = []) {
+  const agentLines = availableAgents.map((agent) => `- ${agent.id}: role=${agent.role}, type=${agent.type}, canEditFiles=${agent.capabilities.canEditFiles}, canRunCommands=${agent.capabilities.canRunShell}`);
+  const taskShape = {
+    summary: "brief plan summary",
+    tasks: [{
+      to: availableAgents.length ? availableAgents.map((agent) => agent.id).join(" | ") : "gemini | cursor | copilot",
+      objective: "short task objective",
+      instructions: "specific instructions for the assigned subagent",
+      expectedOutput: "patch | review | answer | test-report",
+      canEditFiles: true,
+      canRunCommands: true,
+      constraints: ["constraint"]
+    }]
+  };
   return [
     "You are the chief planning orchestrator.",
     "You should not directly edit files unless explicitly asked.",
     "Break the user objective into small implementation/review/test tasks.",
     "Delegate each task to one subagent.",
+    availableAgents.length ? "Use only the enabled subagent ids listed below. Do not assign tasks to any other adapter id." : "If no enabled subagents are listed, return an empty tasks array and explain why in the summary.",
+    availableAgents.length ? ["Enabled subagents:", ...agentLines].join(`
+`) : "Enabled subagents: none",
     "Prefer isolated worktrees for implementation.",
     "Require every subagent to return summary, changed files, diff, commands run, tests run, errors, risks, and follow-up questions.",
     "Return only JSON. Do not wrap it in markdown.",
     "The JSON must match this shape:",
-    JSON.stringify({
-      summary: "brief plan summary",
-      tasks: [{
-        to: "gemini | cursor | copilot",
-        objective: "short task objective",
-        instructions: "specific instructions for the assigned subagent",
-        expectedOutput: "patch | review | answer | test-report",
-        canEditFiles: true,
-        canRunCommands: true,
-        constraints: ["constraint"]
-      }]
-    }, null, 2),
+    JSON.stringify(taskShape, null, 2),
     "",
     `User objective: ${objective}`
   ].join(`
@@ -608,7 +638,7 @@ function plannerPrompt(objective) {
 }
 
 // src/agent-router/daemon/state-store.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
 import { dirname, resolve as resolve4 } from "path";
 
 class AgentRouterStateStore {
@@ -620,7 +650,7 @@ class AgentRouterStateStore {
     try {
       if (!existsSync2(this.statePath))
         return { rooms: [], tasks: [] };
-      const parsed = JSON.parse(readFileSync2(this.statePath, "utf-8"));
+      const parsed = JSON.parse(readFileSync3(this.statePath, "utf-8"));
       return {
         rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
         tasks: Array.isArray(parsed.tasks) ? parsed.tasks : []

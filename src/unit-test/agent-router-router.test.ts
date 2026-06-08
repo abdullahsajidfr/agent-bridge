@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRegistry } from "../agent-router/daemon/registry";
-import { AgentRouter } from "../agent-router/daemon/router";
+import { AgentRouter, plannerPrompt, plannerText } from "../agent-router/daemon/router";
 import { DEFAULT_AGENT_ROUTER_CONFIG, type AgentRouterConfig } from "../agent-router/daemon/config";
+import { parseAgentPlan } from "../agent-router/daemon/plan-parser";
 import type { AgentAdapter, AgentResult, AgentStatus, AgentTask } from "../agent-router/protocol/types";
 
 class MockAdapter implements AgentAdapter {
@@ -118,5 +119,47 @@ describe("AgentRouter", () => {
     expect(result.subtaskResults.map((item) => item.agentId)).toEqual(["gemini", "copilot"]);
     expect(gemini.sentTasks[0].roomId).toBe(planner.sentTasks[0].roomId);
     expect(copilot.sentTasks[0].roomId).toBe(planner.sentTasks[0].roomId);
+  });
+
+  test("extracts full planner stdout from raw logs before parsing", () => {
+    const logPath = join(tempDir, "planner.log");
+    const plan = {
+      summary: "Long JSONL output plan",
+      tasks: [{ to: "gemini", objective: "Implement UI", expectedOutput: "patch", canEditFiles: true }],
+    };
+    writeFileSync(logPath, [
+      "$ codex exec --json",
+      "",
+      "STDOUT:",
+      "noise ".repeat(1000),
+      JSON.stringify({ type: "agent_message", text: JSON.stringify(plan) }),
+      "",
+      "STDERR:",
+      "",
+    ].join("\n"));
+
+    const text = plannerText({
+      taskId: "task_1",
+      agentId: "codex",
+      status: "success",
+      summary: "truncated output without the actual plan",
+      changedFiles: [],
+      commandsRun: [{ command: "codex exec", stdout: "also truncated" }],
+      testsRun: [],
+      risks: [],
+      questions: [],
+      rawLogPath: logPath,
+    });
+
+    expect(parseAgentPlan(text).tasks[0].objective).toBe("Implement UI");
+  });
+
+  test("planner prompt constrains assignments to enabled subagents", () => {
+    const prompt = plannerPrompt("Improve network UI", [new MockAdapter("gemini"), new MockAdapter("copilot", "copilot", "reviewer")]);
+
+    expect(prompt).toContain("Use only the enabled subagent ids listed below");
+    expect(prompt).toContain("- gemini:");
+    expect(prompt).toContain("- copilot:");
+    expect(prompt).not.toContain("- cursor:");
   });
 });

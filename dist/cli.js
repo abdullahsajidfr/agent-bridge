@@ -1326,7 +1326,6 @@ var require_package = __commonJS((exports, module) => {
       start: "bun run src/bridge.ts",
       "build:cli": "mkdir -p dist && bun build src/cli.ts --outfile dist/cli.js --target bun && bun build src/agent-router/cli.ts --outfile dist/agent-router.js --target bun && chmod +x dist/cli.js dist/agent-router.js",
       "build:plugin": "mkdir -p plugins/agentbridge/server && bun build src/bridge.ts --outfile plugins/agentbridge/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/agentbridge/server/daemon.js --target bun",
-      prepare: "bun run build:cli",
       "verify:plugin-sync": "node scripts/verify-plugin-sync.cjs",
       prepublishOnly: "bun run build:cli && bun run build:plugin",
       "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",

@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { AgentResult, AgentTask, AgentTaskExpectedOutput } from "../protocol/types";
+import type { AgentAdapter, AgentResult, AgentTask, AgentTaskExpectedOutput } from "../protocol/types";
 import type { AgentRouterConfig } from "./config";
 import { AgentRegistry } from "./registry";
 import { PolicyEngine } from "./policy-engine";
@@ -90,10 +91,11 @@ export class AgentRouter {
   }
 
   async runPlan(plannerId: string, objective: string): Promise<AgentResult> {
+    const availableAgents = this.registry.list().filter((agent) => agent.id !== plannerId);
     return await this.assign({
       to: plannerId,
       objective,
-      instructions: plannerPrompt(objective),
+      instructions: plannerPrompt(objective, availableAgents),
       expectedOutput: "answer",
       canEditFiles: false,
       canRunCommands: true,
@@ -136,35 +138,61 @@ export class AgentRouter {
   }
 }
 
-function plannerText(result: AgentResult): string {
+export function plannerText(result: AgentResult): string {
   return [
     result.summary,
+    fullStdoutFromRawLog(result.rawLogPath),
     result.commandsRun.map((command) => command.stdout).filter(Boolean).join("\n"),
   ].filter(Boolean).join("\n");
 }
 
-export function plannerPrompt(objective: string): string {
+function fullStdoutFromRawLog(rawLogPath?: string): string | undefined {
+  if (!rawLogPath) return undefined;
+  try {
+    const rawLog = readFileSync(rawLogPath, "utf8");
+    const stdoutMarker = "\nSTDOUT:\n";
+    const stderrMarker = "\n\nSTDERR:\n";
+    const stdoutStart = rawLog.indexOf(stdoutMarker);
+    if (stdoutStart === -1) return rawLog;
+    const contentStart = stdoutStart + stdoutMarker.length;
+    const stderrStart = rawLog.indexOf(stderrMarker, contentStart);
+    return rawLog.slice(contentStart, stderrStart === -1 ? undefined : stderrStart);
+  } catch {
+    return undefined;
+  }
+}
+
+export function plannerPrompt(objective: string, availableAgents: AgentAdapter[] = []): string {
+  const agentLines = availableAgents.map((agent) => (
+    `- ${agent.id}: role=${agent.role}, type=${agent.type}, canEditFiles=${agent.capabilities.canEditFiles}, canRunCommands=${agent.capabilities.canRunShell}`
+  ));
+  const taskShape = {
+    summary: "brief plan summary",
+    tasks: [{
+      to: availableAgents.length ? availableAgents.map((agent) => agent.id).join(" | ") : "gemini | cursor | copilot",
+      objective: "short task objective",
+      instructions: "specific instructions for the assigned subagent",
+      expectedOutput: "patch | review | answer | test-report",
+      canEditFiles: true,
+      canRunCommands: true,
+      constraints: ["constraint"],
+    }],
+  };
+
   return [
     "You are the chief planning orchestrator.",
     "You should not directly edit files unless explicitly asked.",
     "Break the user objective into small implementation/review/test tasks.",
     "Delegate each task to one subagent.",
+    availableAgents.length
+      ? "Use only the enabled subagent ids listed below. Do not assign tasks to any other adapter id."
+      : "If no enabled subagents are listed, return an empty tasks array and explain why in the summary.",
+    availableAgents.length ? ["Enabled subagents:", ...agentLines].join("\n") : "Enabled subagents: none",
     "Prefer isolated worktrees for implementation.",
     "Require every subagent to return summary, changed files, diff, commands run, tests run, errors, risks, and follow-up questions.",
     "Return only JSON. Do not wrap it in markdown.",
     "The JSON must match this shape:",
-    JSON.stringify({
-      summary: "brief plan summary",
-      tasks: [{
-        to: "gemini | cursor | copilot",
-        objective: "short task objective",
-        instructions: "specific instructions for the assigned subagent",
-        expectedOutput: "patch | review | answer | test-report",
-        canEditFiles: true,
-        canRunCommands: true,
-        constraints: ["constraint"],
-      }],
-    }, null, 2),
+    JSON.stringify(taskShape, null, 2),
     "",
     `User objective: ${objective}`,
   ].join("\n");
