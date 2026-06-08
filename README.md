@@ -109,6 +109,32 @@ abg codex
 
 That's it. The daemon starts automatically when needed and reconnects if restarted.
 
+### Install This AgentRouter Fork
+
+This fork adds a local `agent-router` CLI alongside the existing AgentBridge plugin. Install the plugin marketplace from the fork, then install the CLI from GitHub:
+
+```bash
+# 1. In Claude Code, add the fork marketplace
+/plugin marketplace add abdullahsajidfr/agent-bridge
+
+# 2. Install the plugin
+/plugin install agentbridge@agentbridge
+
+# 3. Reload plugins to activate
+/reload-plugins
+```
+
+Then install and initialize the forked CLI:
+
+```bash
+npm install -g github:abdullahsajidfr/agent-bridge
+agentbridge init
+agent-router config:validate
+agent-router agents:list
+```
+
+AgentRouter configuration lives in `agent-router.config.json`. Use it to override local command names and flags for Codex, Cursor, Gemini, and Copilot CLI. Agent command args may include `{prompt}` when the prompt must appear in a specific argument position.
+
 #### Updating the plugin
 
 When a new version is released, update from Claude Code:
@@ -161,6 +187,25 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` | Show help |
 | `abg --version` | Show version |
+
+## AgentRouter CLI Reference
+
+AgentRouter is the local multi-agent orchestration layer added in this fork. Codex is the planner/orchestrator, while Cursor, Gemini, and Copilot CLI are configurable subagent adapters.
+
+| Command | Description |
+|---------|-------------|
+| `agent-router init` | Create `agent-router.config.json` if missing |
+| `agent-router config:validate` | Validate router config |
+| `agent-router agents:list` | List enabled configured adapters |
+| `agent-router agents:status` | Show adapter status details |
+| `agent-router task:assign --to gemini --objective "..."` | Assign a task to a subagent |
+| `agent-router task:review --to copilot --diff` | Ask a reviewer subagent to review the current git diff |
+| `agent-router task:run-plan --planner codex --objective "..."` | Ask Codex for an orchestration plan |
+| `agent-router rooms:list` | List persisted task rooms |
+| `agent-router rooms:show <roomId>` | Show a room and its task records |
+| `agent-router worktrees:clean` | Remove router-created worktree directory |
+
+Use `--dry-run` on task commands to inspect what would be executed without calling external CLIs.
 
 ### Owned flags
 

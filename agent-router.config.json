@@ -1,0 +1,38 @@
+{
+  "planner": "codex",
+  "repoPath": ".",
+  "worktreesDir": "../.agent-worktrees",
+  "agents": {
+    "codex": {
+      "enabled": true,
+      "command": "codex",
+      "args": ["exec", "--json"],
+      "role": "planner"
+    },
+    "gemini": {
+      "enabled": true,
+      "command": "gemini",
+      "args": ["-p"],
+      "role": "implementer"
+    },
+    "copilot": {
+      "enabled": true,
+      "command": "copilot",
+      "args": ["--prompt"],
+      "role": "reviewer"
+    },
+    "cursor": {
+      "enabled": false,
+      "command": "cursor-agent",
+      "args": [],
+      "role": "implementer"
+    }
+  },
+  "policies": {
+    "requireHumanApprovalBeforeApply": true,
+    "allowSubagentShellCommands": true,
+    "allowSubagentGitCommands": false,
+    "maxConcurrentTasks": 3,
+    "defaultTimeoutMs": 600000
+  }
+}

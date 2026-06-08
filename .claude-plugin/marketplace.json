@@ -1,9 +1,9 @@
 {
   "name": "agentbridge",
   "owner": {
-    "name": "AgentBridge Contributors",
-    "email": "raysonmeng@qq.com",
-    "url": "https://github.com/raysonmeng/agent-bridge"
+    "name": "Abdullah Sajid",
+    "email": "27100144@lums.edu.pk",
+    "url": "https://github.com/abdullahsajidfr/agent-bridge"
   },
   "metadata": {
     "description": "Marketplace for the AgentBridge Claude Code plugin and supporting runtime integration."
@@ -11,11 +11,11 @@
   "plugins": [
     {
       "name": "agentbridge",
-      "description": "Bridge Claude Code and Codex through a shared daemon, push channel delivery, and reply/get_messages tools.",
+      "description": "Bridge Claude Code and Codex, plus local AgentRouter orchestration for Codex, Cursor, Gemini, and Copilot CLI.",
       "version": "0.1.6",
       "author": {
-        "name": "AgentBridge Contributors",
-        "email": "raysonmeng@qq.com"
+        "name": "Abdullah Sajid",
+        "email": "27100144@lums.edu.pk"
       },
       "source": "./plugins/agentbridge",
       "category": "development"

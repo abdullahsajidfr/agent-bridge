@@ -35,6 +35,24 @@ This creates self-contained bundles at:
 2. In Claude Code, load the plugin from this repo or install it from the marketplace manifest in `.claude-plugin/marketplace.json`
 3. Reload plugins in the active session with `/reload-plugins`
 
+## Installing This Fork
+
+In Claude Code:
+
+```bash
+/plugin marketplace add abdullahsajidfr/agent-bridge
+/plugin install agentbridge@agentbridge
+/reload-plugins
+```
+
+Then install the matching CLI from the fork:
+
+```bash
+npm install -g github:abdullahsajidfr/agent-bridge
+agentbridge init
+agent-router config:validate
+```
+
 ## Notes
 
 - The plugin frontend launches the sibling daemon bundle via `AGENTBRIDGE_DAEMON_ENTRY=./daemon.js`.
