@@ -893,7 +893,7 @@ class CliAgentAdapter {
     };
   }
   buildPrompt(task) {
-    return [
+    const lines = [
       `You are the ${this.id} ${this.role} subagent in AgentRouter.`,
       `Task id: ${task.id}`,
       `Room id: ${task.roomId}`,
@@ -913,7 +913,14 @@ ${task.allowedFiles.map((item) => `- ${item}`).join(`
 `)}` : "",
       task.disallowedFiles?.length ? `Disallowed files:
 ${task.disallowedFiles.map((item) => `- ${item}`).join(`
-`)}` : "",
+`)}` : ""
+    ];
+    if (this.role === "planner") {
+      return lines.filter(Boolean).join(`
+`);
+    }
+    return [
+      ...lines,
       "",
       "Return a JSON object with this shape:",
       JSON.stringify({

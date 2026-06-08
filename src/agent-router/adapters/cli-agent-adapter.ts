@@ -121,7 +121,7 @@ export class CliAgentAdapter implements AgentAdapter {
   }
 
   private buildPrompt(task: AgentTask): string {
-    return [
+    const lines = [
       `You are the ${this.id} ${this.role} subagent in AgentRouter.`,
       `Task id: ${task.id}`,
       `Room id: ${task.roomId}`,
@@ -136,6 +136,14 @@ export class CliAgentAdapter implements AgentAdapter {
       task.constraints.length ? `Constraints:\n${task.constraints.map((item) => `- ${item}`).join("\n")}` : "Constraints: none",
       task.allowedFiles?.length ? `Allowed files:\n${task.allowedFiles.map((item) => `- ${item}`).join("\n")}` : "",
       task.disallowedFiles?.length ? `Disallowed files:\n${task.disallowedFiles.map((item) => `- ${item}`).join("\n")}` : "",
+    ];
+
+    if (this.role === "planner") {
+      return lines.filter(Boolean).join("\n");
+    }
+
+    return [
+      ...lines,
       "",
       "Return a JSON object with this shape:",
       JSON.stringify({
